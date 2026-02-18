@@ -339,7 +339,7 @@ class DeribitAnalyzer:
                     strike=strike,
                     call_open=float(c.get("open_interest") or 0.0),
                     call_delta=call_delta,
-                    call_annual=c_mark * (TRADING_DAYS / days_to_expiry),
+                    call_annual=c_bid * (TRADING_DAYS / days_to_expiry),
                     call_bid=c_bid,
                     call_mark=c_mark,
                     call_ask=float(c.get("ask_price") or 0.0),
@@ -347,7 +347,7 @@ class DeribitAnalyzer:
                     put_bid=p_bid,
                     put_mark=p_mark,
                     put_ask=float(p.get("ask_price") or 0.0),
-                    put_annual=(p_mark * p_underlying / strike) * (TRADING_DAYS / days_to_expiry),
+                    put_annual=(p_bid * p_underlying / strike) * (TRADING_DAYS / days_to_expiry),
                     put_hook_annual=(p_bid * p_underlying / strike) * (TRADING_DAYS / days_to_expiry),
                     put_delta=put_delta,
                     put_open=float(p.get("open_interest") or 0.0),
@@ -420,7 +420,7 @@ class PricingEngine:
                     strike=strike,
                     call_open=call_itm,
                     call_delta=call_delta,
-                    call_annual=(call_premium / spot) * (TRADING_DAYS / days_to_expiry),
+                    call_annual=(call_bid / spot) * (TRADING_DAYS / days_to_expiry),
                     call_bid=call_bid,
                     call_mark=call_premium,
                     call_ask=call_ask,
@@ -428,7 +428,7 @@ class PricingEngine:
                     put_bid=put_bid,
                     put_mark=put_premium,
                     put_ask=put_ask,
-                    put_annual=(put_premium / strike) * (TRADING_DAYS / days_to_expiry),
+                    put_annual=(put_bid / strike) * (TRADING_DAYS / days_to_expiry),
                     put_hook_annual=(put_bid / strike) * (TRADING_DAYS / days_to_expiry),
                     put_delta=put_delta,
                     put_open=put_itm,
@@ -583,7 +583,7 @@ class MainWindow(QMainWindow):
         self.time_card = self._make_info_card("Time", self.time_label, 205)
         self.spot_card = self._make_info_card("Spot", self.spot_label, 150)
         self.iv_card = self._make_info_card("IV", self.iv_label, 300)
-        self.hook_card = self._make_info_card("ATM Hook Annual", self.hook_label, 280)
+        self.hook_card = self._make_info_card("ATM Annual (Bid)", self.hook_label, 280)
         self.source_card = self._make_info_card("Source", self.source_label, 420)
         self.source_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         info_row.addWidget(self.time_card)
@@ -615,7 +615,7 @@ class MainWindow(QMainWindow):
                 "Bid",
                 "Mark",
                 "Ask",
-                "Strike / Hook Annual",
+                "Strike",
                 "Bid",
                 "Mark",
                 "Ask",
@@ -832,7 +832,7 @@ class MainWindow(QMainWindow):
         self.source_label.setText(source_text)
         atm_row = next((x for x in rows if x.is_atm), None)
         if atm_row:
-            self.hook_label.setText(f"Call {atm_row.call_hook_annual:.3%} / Put {atm_row.put_hook_annual:.3%}")
+            self.hook_label.setText(f"Call {atm_row.call_annual:.3%} / Put {atm_row.put_annual:.3%}")
         else:
             self.hook_label.setText("--")
 
@@ -859,7 +859,7 @@ class MainWindow(QMainWindow):
             f"{row.call_bid:,.4f}",
             f"{row.call_mark:,.4f}",
             f"{row.call_ask:,.4f}",
-            f"{row.strike:,.0f}\nC {row.call_hook_annual:.3%} | P {row.put_hook_annual:.3%}",
+            f"{row.strike:,.0f}",
             f"{row.put_bid:,.4f}",
             f"{row.put_mark:,.4f}",
             f"{row.put_ask:,.4f}",
@@ -1005,8 +1005,11 @@ class MainWindow(QMainWindow):
 
         if is_atm and col_idx == 6:
             bg = QColor("#3d2d86")
-            item.setText(f"ATM {value}")
+            item.setText(value)
             item.setForeground(QColor("#ffffff"))
+            atm_font = item.font()
+            atm_font.setBold(True)
+            item.setFont(atm_font)
         elif col_idx in (3, 7):
             item.setForeground(QColor("#00d37f"))
         elif col_idx in (5, 9):

@@ -8,9 +8,7 @@
 
 ## 核心價值
 - 同一套 UI 同時支援「模型定價」與「交易所即時報價」。
-- 在 Deribit 原始報價之外，補上年化視角：
-  - 各腿 `Annual`
-  - 中間欄位 `Hook Annual`（`C ... | P ...`）
+- 在 Deribit 原始報價之外，補上年化視角：各腿 `Annual`（以 `Bid` 模擬可賣出價格）
 
 ## 功能總覽
 - Deribit 風格鏈表：`Calls | Strike | Puts`
@@ -28,7 +26,7 @@
 - 來源：Deribit public API
 - 可選到期日 (`Expiry`) 與重載到期日 (`Reload Exp`)
 - 顯示真實 `Bid/Mark/Ask`
-- 補上年化資訊：`Annual`、`Hook Annual`
+- 補上年化資訊：`Annual`（以 `Bid` 模擬可賣出價格）
 - `Spot` 以 `USD` 顯示
 - `IV` 卡片顯示為：
   - `DVOL 當前值`
@@ -47,9 +45,9 @@
 - `Open Int`：Deribit 模式為未平倉量
 - `ITM Prob`：Binance 模式為模型估計到價內機率
 - `Δ|Delta`：Delta
-- `Annual`：以 Mark 價換算的年化
+- `Annual`：以 Bid 價換算的年化（模擬可賣出）
 - `Bid / Mark / Ask`：買價 / 中間價 / 賣價
-- `Strike / Hook Annual`：中間欄位顯示履約價與 `C ... | P ...` 年化資訊
+- `Strike`：中間欄位僅顯示履約價
 
 ## 安裝
 ```bash
