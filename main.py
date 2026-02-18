@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
@@ -174,6 +175,7 @@ class MarketAnalyzer:
 
 class DeribitAnalyzer:
     BASE_URL = "https://www.deribit.com/api/v2"
+    _VOL_PERCENTILE_CACHE: Dict[str, Tuple[float, str]] = {}
 
     def __init__(self, currency: str):
         self.currency = currency.upper()
@@ -209,6 +211,44 @@ class DeribitAnalyzer:
         t = max(t_years, 1e-9)
         _, _, call_delta, put_delta = PricingEngine.bs_call_put(spot, strike, iv, t)
         return call_delta, put_delta
+
+    def _fetch_volatility_percentile_text(self, lookback_days: int = 365) -> str:
+        cache_key = f"{self.currency}:{lookback_days}"
+        cached = self._VOL_PERCENTILE_CACHE.get(cache_key)
+        now_monotonic = time.monotonic()
+        if cached and now_monotonic - cached[0] < 120.0:
+            return cached[1]
+
+        end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ts = end_ts - lookback_days * 24 * 3600 * 1000
+        payload = self._get(
+            "public/get_volatility_index_data",
+            currency=self.currency,
+            start_timestamp=start_ts,
+            end_timestamp=end_ts,
+            resolution="1D",
+        )
+
+        rows = payload.get("data", [])
+        closes: List[float] = []
+        for row in rows:
+            close_value = None
+            if isinstance(row, dict):
+                close_value = row.get("close")
+            elif isinstance(row, list) and len(row) >= 5:
+                close_value = row[4]
+            if close_value is None:
+                continue
+            closes.append(float(close_value))
+
+        if not closes:
+            raise ValueError("No volatility-index data from Deribit")
+
+        current_val = closes[-1]
+        percentile = 100.0 * sum(1 for x in closes if x <= current_val) / len(closes)
+        text = f"DVOL {current_val:.2f} ({percentile:.1f}%, 1Y)"
+        self._VOL_PERCENTILE_CACHE[cache_key] = (now_monotonic, text)
+        return text
 
     def fetch_chain(self, expiry_ts: int, wing_count: int) -> Tuple[float, str, List[ChainRow]]:
         spot = float(self._get("public/get_index_price", index_name=f"{self.currency.lower()}_usd")["index_price"])
@@ -272,7 +312,11 @@ class DeribitAnalyzer:
             mark_iv = leg.get("mark_iv")
             if mark_iv is not None:
                 iv_candidates.append(float(mark_iv) / 100.0)
-        iv_text = f"{(sum(iv_candidates)/len(iv_candidates)):.2%} (Deribit ATM IV)" if iv_candidates else "--"
+        atm_iv_text = f"{(sum(iv_candidates)/len(iv_candidates)):.2%} (Deribit ATM IV)" if iv_candidates else "--"
+        try:
+            iv_text = self._fetch_volatility_percentile_text(lookback_days=365)
+        except Exception:
+            iv_text = atm_iv_text
 
         rows: List[ChainRow] = []
         for strike in picked_strikes:
@@ -400,6 +444,28 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("BTC Options Chain Analyzer")
         self.resize(1360, 870)
+        self._base_window_w = 1360
+        self._base_window_h = 870
+        self._ui_scale = 1.0
+        self._base_table_widths = {
+            0: 78,
+            1: 88,
+            2: 88,
+            3: 102,
+            4: 108,
+            5: 102,
+            6: 205,
+            7: 102,
+            8: 108,
+            9: 102,
+            10: 88,
+            11: 88,
+            12: 78,
+        }
+        self._base_row_height = 44
+        self._base_symbol_w = 130
+        self._base_horizon_w = 190
+        self._base_toggle_w = 190
         self._expiry_choices: List[Tuple[int, str]] = []
         self._expiry_currency: str = ""
         self._expiry_loaded_at: float = 0.0
@@ -429,59 +495,48 @@ class MainWindow(QMainWindow):
 
         top_bar = QFrame()
         top_bar.setObjectName("topBar")
-        top_bar.setMinimumHeight(64)
-        top_bar.setMaximumHeight(64)
+        self.top_bar = top_bar
         top_row = QHBoxLayout(top_bar)
         top_row.setContentsMargins(8, 8, 8, 8)
         top_row.setSpacing(8)
         top_row.setAlignment(Qt.AlignVCenter)
 
         self.symbol_input = QLineEdit("BTC/USDT")
-        self.symbol_input.setFixedWidth(110)
-        self.symbol_input.setFixedHeight(30)
+        self.symbol_input.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         self.days_spin = QSpinBox()
         self.days_spin.setRange(1, 60)
         self.days_spin.setValue(7)
-        self.days_spin.setFixedWidth(190)
-        self.days_spin.setFixedHeight(30)
+        self.days_spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.days_spin.valueChanged.connect(lambda _: self.refresh_data(manual=False))
 
         self.expiry_combo = QComboBox()
-        self.expiry_combo.setFixedWidth(190)
-        self.expiry_combo.setFixedHeight(30)
         self.expiry_combo.addItem("Enable Deribit and Refresh")
+        self.expiry_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.expiry_combo.currentIndexChanged.connect(lambda: self.refresh_data(manual=False))
 
         self.horizon_label = QLabel("Horizon")
         self.horizon_stack = QStackedWidget()
-        self.horizon_stack.setFixedWidth(190)
-        self.horizon_stack.setFixedHeight(30)
+        self.horizon_stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.horizon_stack.addWidget(self.days_spin)
         self.horizon_stack.addWidget(self.expiry_combo)
 
         self.wings_spin = QSpinBox()
         self.wings_spin.setRange(3, 30)
         self.wings_spin.setValue(7)
-        self.wings_spin.setFixedWidth(70)
-        self.wings_spin.setFixedHeight(30)
         self.wings_spin.valueChanged.connect(lambda _: self.refresh_data(manual=False))
 
         self.refresh_spin = QSpinBox()
         self.refresh_spin.setRange(5, 300)
         self.refresh_spin.setValue(20)
-        self.refresh_spin.setFixedWidth(70)
-        self.refresh_spin.setFixedHeight(30)
         self.refresh_spin.valueChanged.connect(lambda _: self._toggle_timer(self.auto_check.isChecked()))
 
         self.deribit_check = QCheckBox("Deribit Chain")
         self.deribit_check.setChecked(False)
-        self.deribit_check.setFixedWidth(96)
         self.deribit_check.toggled.connect(self._on_mode_changed)
 
         self.auto_check = QCheckBox("Auto")
         self.auto_check.setChecked(True)
-        self.auto_check.setFixedWidth(64)
         self.auto_check.toggled.connect(self._toggle_timer)
 
         top_row.addWidget(QLabel("Symbol"))
@@ -489,30 +544,25 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.horizon_label)
         top_row.addWidget(self.horizon_stack)
         self.reload_expiry_btn = QPushButton("Reload Exp")
-        self.reload_expiry_btn.setFixedWidth(92)
-        self.reload_expiry_btn.setFixedHeight(30)
         self.reload_expiry_btn.clicked.connect(self._force_reload_expiries)
         top_row.addWidget(self.reload_expiry_btn)
         top_row.addWidget(QLabel("ATM Wings"))
         top_row.addWidget(self.wings_spin)
+        top_row.addStretch(1)
         top_row.addWidget(QLabel("Refresh Sec"))
         top_row.addWidget(self.refresh_spin)
 
         toggle_box = QFrame()
+        self.toggle_box = toggle_box
         toggle_box.setObjectName("toggleBox")
-        toggle_box.setFixedWidth(190)
-        toggle_box.setFixedHeight(34)
         toggle_row = QHBoxLayout(toggle_box)
         toggle_row.setContentsMargins(8, 4, 8, 4)
         toggle_row.setSpacing(10)
         toggle_row.addWidget(self.deribit_check)
         toggle_row.addWidget(self.auto_check)
         top_row.addWidget(toggle_box)
-        top_row.addStretch(1)
 
         self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.setFixedWidth(90)
-        self.refresh_btn.setFixedHeight(34)
         self.refresh_btn.clicked.connect(lambda: self.refresh_data(manual=True))
         top_row.addWidget(self.refresh_btn)
 
@@ -530,12 +580,17 @@ class MainWindow(QMainWindow):
         self.source_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.hook_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        info_row.addWidget(self._make_info_card("Time", self.time_label, 205))
-        info_row.addWidget(self._make_info_card("Spot", self.spot_label, 150))
-        info_row.addWidget(self._make_info_card("IV", self.iv_label, 230))
-        info_row.addWidget(self._make_info_card("ATM Hook Annual", self.hook_label, 280))
-        info_row.addWidget(self._make_info_card("Source", self.source_label, 420))
-        info_row.addStretch(1)
+        self.time_card = self._make_info_card("Time", self.time_label, 205)
+        self.spot_card = self._make_info_card("Spot", self.spot_label, 150)
+        self.iv_card = self._make_info_card("IV", self.iv_label, 300)
+        self.hook_card = self._make_info_card("ATM Hook Annual", self.hook_label, 280)
+        self.source_card = self._make_info_card("Source", self.source_label, 420)
+        self.source_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        info_row.addWidget(self.time_card)
+        info_row.addWidget(self.spot_card)
+        info_row.addWidget(self.iv_card)
+        info_row.addWidget(self.hook_card)
+        info_row.addWidget(self.source_card, 1)
 
         chain_header = QHBoxLayout()
         calls_title = QLabel("Calls")
@@ -584,12 +639,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.table)
 
         self._on_mode_changed(self.deribit_check.isChecked())
+        self._apply_ui_scale(force=True)
         self._toggle_timer(True)
 
     def _make_info_card(self, title: str, value_label: QLabel, width: int) -> QFrame:
         card = QFrame()
         card.setObjectName("infoCard")
-        card.setFixedWidth(width)
+        card.setProperty("baseWidth", width)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(10, 7, 10, 7)
         card_layout.setSpacing(2)
@@ -776,7 +832,7 @@ class MainWindow(QMainWindow):
         self.source_label.setText(source_text)
         atm_row = next((x for x in rows if x.is_atm), None)
         if atm_row:
-            self.hook_label.setText(f"Put {atm_row.put_hook_annual:.3%} / Call {atm_row.call_hook_annual:.3%}")
+            self.hook_label.setText(f"Call {atm_row.call_hook_annual:.3%} / Put {atm_row.put_hook_annual:.3%}")
         else:
             self.hook_label.setText("--")
 
@@ -790,6 +846,7 @@ class MainWindow(QMainWindow):
 
     def _populate_table(self, rows: List[ChainRow]):
         self.table.setRowCount(len(rows))
+        self._apply_table_widths()
 
         for r, row in enumerate(rows):
             self._repaint_row(r)
@@ -802,7 +859,7 @@ class MainWindow(QMainWindow):
             f"{row.call_bid:,.4f}",
             f"{row.call_mark:,.4f}",
             f"{row.call_ask:,.4f}",
-            f"{row.strike:,.0f}\nP {row.put_hook_annual:.3%} | C {row.call_hook_annual:.3%}",
+            f"{row.strike:,.0f}\nC {row.call_hook_annual:.3%} | P {row.put_hook_annual:.3%}",
             f"{row.put_bid:,.4f}",
             f"{row.put_mark:,.4f}",
             f"{row.put_ask:,.4f}",
@@ -815,11 +872,66 @@ class MainWindow(QMainWindow):
         if row_idx < 0 or row_idx >= len(self._last_rows):
             return
         row = self._last_rows[row_idx]
-        self.table.setRowHeight(row_idx, 44)
+        self.table.setRowHeight(row_idx, self._s(self._base_row_height))
         data = self._row_values(row)
         for c, value in enumerate(data):
             item = self._make_item(row_idx, c, value, row.is_atm)
             self.table.setItem(row_idx, c, item)
+
+    def _s(self, value: int) -> int:
+        return max(1, int(round(value * self._ui_scale)))
+
+    def _apply_ui_scale(self, force: bool = False):
+        if self._base_window_w <= 0 or self._base_window_h <= 0:
+            return
+        scale = min(self.width() / self._base_window_w, self.height() / self._base_window_h)
+        scale = min(max(scale, 0.85), 2.0)
+        if not force and abs(scale - self._ui_scale) < 1e-6:
+            return
+        self._ui_scale = scale
+
+        self.top_bar.setMinimumHeight(self._s(64))
+        self.top_bar.setMaximumHeight(self._s(64))
+        self.symbol_input.setFixedWidth(self._base_symbol_w)
+        self.symbol_input.setFixedHeight(self._s(30))
+        self.days_spin.setFixedWidth(self._base_horizon_w)
+        self.days_spin.setFixedHeight(self._s(30))
+        self.expiry_combo.setFixedWidth(self._base_horizon_w)
+        self.expiry_combo.setFixedHeight(self._s(30))
+        self.horizon_stack.setFixedWidth(self._base_horizon_w)
+        self.horizon_stack.setFixedHeight(self._s(30))
+        self.wings_spin.setFixedSize(self._s(70), self._s(30))
+        self.refresh_spin.setFixedSize(self._s(70), self._s(30))
+        deribit_w = self.deribit_check.sizeHint().width() + self._s(12)
+        auto_w = self.auto_check.sizeHint().width() + self._s(12)
+        self.deribit_check.setMinimumWidth(deribit_w)
+        self.deribit_check.setMaximumWidth(16777215)
+        self.auto_check.setMinimumWidth(auto_w)
+        self.auto_check.setMaximumWidth(16777215)
+        self.reload_expiry_btn.setFixedSize(self._s(92), self._s(30))
+        min_toggle_w = (
+            self.deribit_check.sizeHint().width()
+            + self.auto_check.sizeHint().width()
+            + self._s(32)
+        )
+        self.toggle_box.setFixedSize(max(self._s(self._base_toggle_w), min_toggle_w), self._s(34))
+        self.refresh_btn.setFixedSize(self._s(90), self._s(34))
+
+        for card in (self.time_card, self.spot_card, self.iv_card, self.hook_card):
+            base_w = int(card.property("baseWidth") or 200)
+            card.setFixedWidth(self._s(base_w))
+        source_base = int(self.source_card.property("baseWidth") or 200)
+        self.source_card.setMinimumWidth(self._s(source_base))
+        self.source_card.setMaximumWidth(16777215)
+
+        self._apply_table_widths()
+        for i in range(self.table.rowCount()):
+            self.table.setRowHeight(i, self._s(self._base_row_height))
+        self._apply_dark_theme()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_ui_scale()
 
     def _on_table_cell_clicked(self, row: int, col: int):
         prev_row = self._active_row
@@ -857,22 +969,21 @@ class MainWindow(QMainWindow):
         return f"{value:,.1f}"
 
     def _apply_table_widths(self):
-        widths = {
-            0: 78,
-            1: 88,
-            2: 88,
-            3: 102,
-            4: 108,
-            5: 102,
-            6: 205,
-            7: 102,
-            8: 108,
-            9: 102,
-            10: 88,
-            11: 88,
-            12: 78,
-        }
-        for col, width in widths.items():
+        scaled_widths = {col: self._s(width) for col, width in self._base_table_widths.items()}
+        total_scaled = sum(scaled_widths.values())
+        viewport_w = max(1, self.table.viewport().width())
+        fill_ratio = (viewport_w / total_scaled) if total_scaled > 0 else 1.0
+
+        # Keep original ratio, but expand to fill available horizontal space when window is wide.
+        if fill_ratio > 1.0:
+            fitted = {col: max(1, int(round(width * fill_ratio))) for col, width in scaled_widths.items()}
+            diff = viewport_w - sum(fitted.values())
+            if diff != 0:
+                center_col = 6
+                fitted[center_col] = max(1, fitted.get(center_col, 1) + diff)
+            scaled_widths = fitted
+
+        for col, width in scaled_widths.items():
             self.table.setColumnWidth(col, width)
 
     def _make_item(self, row_idx: int, col_idx: int, value: str, is_atm: bool) -> QTableWidgetItem:
@@ -909,72 +1020,81 @@ class MainWindow(QMainWindow):
         return item
 
     def _apply_dark_theme(self):
+        card_title_size = self._s(11)
+        card_value_size = self._s(14)
+        control_min_h = self._s(24)
+        control_pad_v = self._s(3)
+        control_pad_h = self._s(6)
+        border_radius = self._s(6)
+        button_radius = self._s(4)
+        line_radius = self._s(3)
+        header_pad = self._s(6)
         self.setStyleSheet(
-            """
-            QWidget {
+            f"""
+            QWidget {{
                 background-color: #0c1016;
                 color: #d4dbeb;
-            }
-            #topBar {
+            }}
+            #topBar {{
                 background-color: #0f1621;
                 border: 1px solid #283243;
-                border-radius: 6px;
-            }
-            #toggleBox {
+                border-radius: {border_radius}px;
+            }}
+            #toggleBox {{
                 background-color: #121c2b;
                 border: 1px solid #2d3d58;
-                border-radius: 6px;
-            }
-            #infoCard {
+                border-radius: {border_radius}px;
+            }}
+            #infoCard {{
                 background-color: #101a28;
                 border: 1px solid #283243;
-                border-radius: 6px;
-            }
-            #cardTitle {
+                border-radius: {border_radius}px;
+            }}
+            #cardTitle {{
                 color: #8fa1bf;
-                font-size: 11px;
-            }
-            #cardValue {
+                font-size: {card_title_size}px;
+            }}
+            #cardValue {{
                 color: #d9e3f5;
-                font-size: 14px;
+                font-size: {card_value_size}px;
                 font-weight: 600;
-            }
-            QLineEdit, QSpinBox {
+            }}
+            QLineEdit, QSpinBox {{
                 background-color: #121826;
                 border: 1px solid #31405a;
-                border-radius: 3px;
-                padding: 3px 6px;
-                min-height: 24px;
-            }
-            QPushButton {
+                border-radius: {line_radius}px;
+                padding: {control_pad_v}px {control_pad_h}px;
+                min-height: {control_min_h}px;
+            }}
+            QPushButton {{
                 background-color: #2463eb;
                 color: #ffffff;
                 border: none;
-                border-radius: 4px;
-                padding: 4px 10px;
-                min-height: 24px;
+                border-radius: {button_radius}px;
+                padding: {self._s(4)}px {self._s(10)}px;
+                min-height: {control_min_h}px;
                 font-weight: 600;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background-color: #2d73ff;
-            }
-            QCheckBox {
+            }}
+            QCheckBox {{
                 spacing: 6px;
                 padding-right: 2px;
-            }
-            QHeaderView::section {
+            }}
+            QHeaderView::section {{
                 background-color: #0f1621;
                 color: #98a5bf;
                 border: 0;
                 border-bottom: 1px solid #283243;
-                padding: 6px;
-            }
-            QTableWidget {
+                padding: {header_pad}px;
+            }}
+            QTableWidget {{
                 border: 1px solid #283243;
                 gridline-color: #273041;
                 selection-background-color: #2a3a56;
                 selection-color: #ffffff;
-            }
+            }}
             """
         )
 

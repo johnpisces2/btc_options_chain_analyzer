@@ -1,58 +1,70 @@
 # BTC Options Chain Analyzer
 
-Desktop options-chain analyzer built with Python + PySide6.
+`BTC Options Chain Analyzer` 是一個用 Python + PySide6 製作的桌面工具，用來同時查看：
+- 理論選擇權價格（Binance 模型模式）
+- 實際交易所報價（Deribit 真實鏈）
 
-It supports two modes:
-- Deribit real chain (public API)
-- Binance modeled chain (spot + 30D historical volatility proxy)
+重點是把兩種視角放在同一個介面，方便快速比較。
 
-## Features
-- Deribit-style options chain layout: `Calls | Strike | Puts`
-- ATM-centered strike display with configurable wings
-- Per-strike hook annualized yields in center column: `P ... | C ...`
-- Side highlight interaction:
-  - click left (Calls) -> highlight only left side of that row
-  - click right (Puts) -> highlight only right side of that row
-- Auto refresh with configurable interval
-- Background data loading (non-blocking UI)
+## 核心價值
+- 同一套 UI 同時支援「模型定價」與「交易所即時報價」。
+- 在 Deribit 原始報價之外，補上年化視角：
+  - 各腿 `Annual`
+  - 中間欄位 `Hook Annual`（`C ... | P ...`）
 
-## Data Modes
+## 功能總覽
+- Deribit 風格鏈表：`Calls | Strike | Puts`
+- 以 ATM 為中心顯示上下翼 (`ATM Wings`)
+- 點擊互動高亮：
+  - 點左側欄位高亮 Calls 半邊
+  - 點右側欄位高亮 Puts 半邊
+- 可設定自動刷新秒數 (`Refresh Sec`)
+- 背景執行資料抓取，不阻塞 UI
+- 視窗放大時介面會等比例調整
 
-### 1) Deribit Chain
-- Uses real options data from Deribit public endpoints
-- Select expiry from dropdown (`Expiry`)
-- `ATM Wings` controls number of strikes above/below ATM
-- `Reload Exp` refreshes available expiries (with cache bypass)
-- `Spot` is displayed in `USD`
+## 資料模式
 
-### 2) Binance Model
-- Uses Binance spot data via `ccxt`
-- Uses 30-day historical volatility (HV) as IV proxy
-- Strike grid is fixed at:
-  - step = `1000`
-  - range = `ATM +/- ATM Wings`
-- `Model Days` affects modeled premium, delta, probability, and annualized metrics
-- `Spot` currency follows symbol quote (for example, `BTC/USDT` -> `USDT`)
+### 1) Deribit Chain（真實交易所資料）
+- 來源：Deribit public API
+- 可選到期日 (`Expiry`) 與重載到期日 (`Reload Exp`)
+- 顯示真實 `Bid/Mark/Ask`
+- 補上年化資訊：`Annual`、`Hook Annual`
+- `Spot` 以 `USD` 顯示
+- `IV` 卡片顯示為：
+  - `DVOL 當前值`
+  - `1Y 百分位（%）`
+  - 例：`DVOL 52.09 (86.3%, 1Y)`
 
-## Column Semantics
-- `Open Int` (Deribit mode): open interest
-- `ITM Prob` (Binance model mode): modeled in-the-money probability
-- `Delta`: option delta
-- `Annual`: annualized return based on mark price
-- `Bid/Mark/Ask`: bid/mark/ask price
-- `Strike / Hook Annual`: strike + hook annualized yields (`P` for sell put, `C` for sell call)
+### 2) Binance Model（理論模型）
+- 來源：Binance spot（透過 `ccxt`）
+- IV 使用 30 日歷史波動率（HV）近似
+- Strike 格：
+  - 間距固定 `1000`
+  - 範圍為 `ATM +/- ATM Wings`
+- `Model Days` 會影響模型價格、Delta、ITM 機率與年化結果
 
-## Install
+## 欄位說明
+- `Open Int`：Deribit 模式為未平倉量
+- `ITM Prob`：Binance 模式為模型估計到價內機率
+- `Δ|Delta`：Delta
+- `Annual`：以 Mark 價換算的年化
+- `Bid / Mark / Ask`：買價 / 中間價 / 賣價
+- `Strike / Hook Annual`：中間欄位顯示履約價與 `C ... | P ...` 年化資訊
+
+## 安裝
 ```bash
 pip install -r requirements.txt
 ```
 
-## Run
+## 執行
 ```bash
 python main.py
 ```
 
-## Notes
-- This tool is for analysis only, not investment advice.
-- Binance mode is model-based and not equal to market implied volatility.
-- Deribit mode depends on network/API availability.
+## Screenshot
+![BTC Options Chain Analyzer](screenshot.png)
+
+## 注意事項
+- 本工具僅供分析，不構成任何投資建議。
+- Binance 模式為模型估算，不等於市場真實隱含波動率。
+- Deribit 模式依賴外部 API 與網路狀態。
