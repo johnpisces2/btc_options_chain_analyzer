@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from iv_history import DeribitIVHistory, IVPoint
 
 TRADING_DAYS = 365.0
 RISK_FREE_RATE = 0.0
@@ -207,6 +208,8 @@ class DeribitAnalyzer:
 
     def __init__(self, currency: str):
         self.currency = currency.upper()
+        storage_dir = Path(__file__).resolve().parent / "iv_history_data"
+        self.iv_history = DeribitIVHistory(currency=self.currency, storage_dir=storage_dir)
 
     def _get(self, method: str, **params) -> dict:
         query = urllib.parse.urlencode(params)
@@ -247,36 +250,38 @@ class DeribitAnalyzer:
         if cached and now_monotonic - cached[0] < 120.0:
             return cached[1]
 
-        end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
-        start_ts = end_ts - lookback_days * 24 * 3600 * 1000
-        payload = self._get(
-            "public/get_volatility_index_data",
-            currency=self.currency,
-            start_timestamp=start_ts,
-            end_timestamp=end_ts,
-            resolution="1D",
-        )
-
-        rows = payload.get("data", [])
-        closes: List[float] = []
-        for row in rows:
-            close_value = None
-            if isinstance(row, dict):
-                close_value = row.get("close")
-            elif isinstance(row, list) and len(row) >= 5:
-                close_value = row[4]
-            if close_value is None:
-                continue
-            closes.append(float(close_value))
-
-        if not closes:
+        points = self.iv_history.fetch_dvol_index_history(timeframe_days=lookback_days, resolution="1D")
+        if not points:
             raise ValueError("No volatility-index data from Deribit")
+        # Persist the latest DVOL history used for percentile display.
+        self.iv_history.store_history(points, source="dvol", timeframe_days=lookback_days, file_format="json")
 
-        current_val = closes[-1]
-        percentile = 100.0 * sum(1 for x in closes if x <= current_val) / len(closes)
+        current_val = points[-1].iv
+        percentile = self.iv_history.calculate_percentile(points, current_value=current_val)
         text = f"DVOL {current_val:.2f} ({percentile:.1f}%, 1Y)"
         self._VOL_PERCENTILE_CACHE[cache_key] = (now_monotonic, text)
         return text
+
+    def fetch_and_store_iv_history(
+        self, timeframe_days: int = 30, source: str = "dvol", file_format: str = "json"
+    ) -> Tuple[List[IVPoint], Path]:
+        """
+        Fetch IV history from Deribit by timeframe and persist it locally.
+        source:
+            - dvol: public/get_volatility_index_data (DVOL close series)
+            - hv:   public/get_historical_volatility
+        """
+        source_name = source.strip().lower()
+        if source_name == "dvol":
+            points = self.iv_history.fetch_dvol_index_history(timeframe_days=timeframe_days, resolution="1D")
+        elif source_name == "hv":
+            points = self.iv_history.fetch_historical_volatility(timeframe_days=timeframe_days)
+        else:
+            raise ValueError("source must be 'dvol' or 'hv'")
+        output_path = self.iv_history.store_history(
+            points, source=source_name, timeframe_days=timeframe_days, file_format=file_format
+        )
+        return points, output_path
 
     def fetch_chain(self, expiry_ts: int, wing_count: int) -> Tuple[float, str, List[ChainRow]]:
         spot = float(self._get("public/get_index_price", index_name=f"{self.currency.lower()}_usd")["index_price"])
