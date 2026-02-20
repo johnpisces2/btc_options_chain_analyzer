@@ -9,8 +9,8 @@
 - 雙模式報價：`Binance Model` / `Deribit Chain`
 - T 字報價表：`Calls | Strike | Puts`
 - 以 ATM 為中心顯示上下翼（`ATM Wings`）
-- Deribit IV 歷史資料擷取（`DVOL` / `Historical Volatility`）
-- IV 百分位計算（例如 `DVOL 51.93 (85.0%, 1Y)`）
+- Deribit DVOL 歷史資料擷取（預設使用近 1 年資料計算百分位）
+- IV 百分位計算與摘要顯示（例如 `DVOL L:45.20/ CUR:51.93 / H:62.10 (85.0%, 1Y)`）
 - 可調整自動刷新（`Refresh Sec`）
 - 4 腿策略組合器：
   - 左側 `Calls`、右側 `Puts`
@@ -23,6 +23,15 @@
   - `Unrealized PnL`
   - `Realized PnL`
   - `Total`
+
+## GUI 欄位說明
+- `Time`：最近一次刷新時間（本地時間）
+- `Spot`：標的現價
+- `IV`：
+  - Deribit 模式：`DVOL L:/ CUR:/ H: (percentile, 1Y)`，其中 `L/H` 為近 30 天低/高值
+  - Binance 模式：`30D HV as IV proxy`
+- `ATM Annual (Bid)`：ATM 年化 Bid（依目前模式與鏈上資料計算）
+- `Source`：目前資料來源與到期日資訊（Deribit 模式）
 
 ## 策略資料持久化
 - 交易紀錄儲存在：`strategy_positions.json`
@@ -46,12 +55,11 @@ python main.py
 
 ## IV 歷史資料 API（程式內）
 - 檔案：`iv_history.py`
+- 類別：`DeribitIVHistory`
 - 端點：
   - `public/get_historical_volatility`
   - `public/get_volatility_index_data`（DVOL）
-- `DeribitAnalyzer` 新增：
-  - `fetch_and_store_iv_history(timeframe_days, source, file_format)`
-    - `timeframe_days`: 1, 7, 30, 365...（任意正整數）
-    - `source`: `dvol` 或 `hv`
-    - `file_format`: `json` 或 `csv`
-  - 儲存路徑：`iv_history_data/`
+- 主要方法：
+  - `fetch_historical_volatility(timeframe_days=30)`：取得歷史波動率資料
+  - `fetch_dvol_index_history(timeframe_days=30, resolution="1D")`：取得 DVOL 歷史資料
+  - `calculate_percentile(points, current_value=None)`：計算目前值在樣本中的百分位

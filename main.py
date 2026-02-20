@@ -208,8 +208,7 @@ class DeribitAnalyzer:
 
     def __init__(self, currency: str):
         self.currency = currency.upper()
-        storage_dir = Path(__file__).resolve().parent / "iv_history_data"
-        self.iv_history = DeribitIVHistory(currency=self.currency, storage_dir=storage_dir)
+        self.iv_history = DeribitIVHistory(currency=self.currency)
 
     def _get(self, method: str, **params) -> dict:
         query = urllib.parse.urlencode(params)
@@ -254,8 +253,6 @@ class DeribitAnalyzer:
         points = self.iv_history.fetch_dvol_index_history(timeframe_days=lookback_days, resolution="1D")
         if not points:
             raise ValueError("No volatility-index data from Deribit")
-        # Persist the latest DVOL history used for percentile display.
-        self.iv_history.store_history(points, source="dvol", timeframe_days=lookback_days, file_format="json")
 
         current_val = points[-1].iv
         percentile = self.iv_history.calculate_percentile(points, current_value=current_val)
@@ -272,27 +269,6 @@ class DeribitAnalyzer:
 
         self._VOL_PERCENTILE_CACHE[cache_key] = (now_monotonic, text)
         return text
-
-    def fetch_and_store_iv_history(
-        self, timeframe_days: int = 30, source: str = "dvol", file_format: str = "json"
-    ) -> Tuple[List[IVPoint], Path]:
-        """
-        Fetch IV history from Deribit by timeframe and persist it locally.
-        source:
-            - dvol: public/get_volatility_index_data (DVOL close series)
-            - hv:   public/get_historical_volatility
-        """
-        source_name = source.strip().lower()
-        if source_name == "dvol":
-            points = self.iv_history.fetch_dvol_index_history(timeframe_days=timeframe_days, resolution="1D")
-        elif source_name == "hv":
-            points = self.iv_history.fetch_historical_volatility(timeframe_days=timeframe_days)
-        else:
-            raise ValueError("source must be 'dvol' or 'hv'")
-        output_path = self.iv_history.store_history(
-            points, source=source_name, timeframe_days=timeframe_days, file_format=file_format
-        )
-        return points, output_path
 
     def fetch_chain(self, expiry_ts: int, wing_count: int) -> Tuple[float, str, List[ChainRow]]:
         spot = float(self._get("public/get_index_price", index_name=f"{self.currency.lower()}_usd")["index_price"])
@@ -596,6 +572,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.horizon_label)
         top_row.addWidget(self.horizon_stack)
         self.reload_expiry_btn = QPushButton("Reload Exp")
+        self.reload_expiry_btn.setMinimumWidth(100)
         self.reload_expiry_btn.clicked.connect(self._force_reload_expiries)
         top_row.addWidget(self.reload_expiry_btn)
         top_row.addWidget(QLabel("ATM Wings"))
@@ -615,6 +592,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(toggle_box)
 
         self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setMinimumWidth(80)
         self.refresh_btn.clicked.connect(lambda: self.refresh_data(manual=True))
         top_row.addWidget(self.refresh_btn)
 
@@ -634,7 +612,7 @@ class MainWindow(QMainWindow):
 
         self.time_card = self._make_info_card("Time", self.time_label, 205)
         self.spot_card = self._make_info_card("Spot", self.spot_label, 150)
-        self.iv_card = self._make_info_card("IV", self.iv_label, 380)
+        self.iv_card = self._make_info_card("IV", self.iv_label, 480)
         self.hook_card = self._make_info_card("ATM Annual (Bid)", self.hook_label, 280)
         self.source_card = self._make_info_card("Source", self.source_label, 420)
         self.source_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -687,10 +665,13 @@ class MainWindow(QMainWindow):
         leg_grid.setColumnStretch(4, 1)
 
         self.open_ic_btn = QPushButton("Open Strategy")
+        self.open_ic_btn.setMinimumWidth(120)
         self.open_ic_btn.clicked.connect(self._open_strategy_position)
         self.close_ic_btn = QPushButton("Close Selected")
+        self.close_ic_btn.setMinimumWidth(120)
         self.close_ic_btn.clicked.connect(self._close_selected_position)
         self.delete_ic_btn = QPushButton("Delete Selected")
+        self.delete_ic_btn.setMinimumWidth(120)
         self.delete_ic_btn.clicked.connect(self._delete_selected_position)
         self.sim_summary_label = QLabel("Unrealized PnL +0.0000 | Realized PnL +0.0000")
         self.sim_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1445,7 +1426,7 @@ class MainWindow(QMainWindow):
         )
         self.toggle_box.setFixedSize(max(self._s(self._base_toggle_w), min_toggle_w), self._s(34))
         self.refresh_btn.setFixedSize(self._s(90), self._s(34))
-        self.open_ic_btn.setFixedSize(self._s(140), self._s(34))
+        self.open_ic_btn.setFixedSize(self._s(180), self._s(34))
         self.close_ic_btn.setFixedSize(self._s(170), self._s(34))
         self.delete_ic_btn.setFixedSize(self._s(176), self._s(34))
         self.sim_bar.setMinimumHeight(self._s(112))
