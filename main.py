@@ -266,7 +266,7 @@ class DeribitAnalyzer:
             iv_values_30d = [p.iv for p in points_30d]
             iv_high_30d = max(iv_values_30d)
             iv_low_30d = min(iv_values_30d)
-            text = f"DVOL {current_val:.2f} ({percentile:.1f}%, 1Y) | 30D High: {iv_high_30d:.2f} Low: {iv_low_30d:.2f}"
+            text = f"DVOL L:{iv_low_30d:.2f}/ CUR:{current_val:.2f} / H:{iv_high_30d:.2f} ({percentile:.1f}%, 1Y)"
         else:
             text = f"DVOL {current_val:.2f} ({percentile:.1f}%, 1Y)"
 
