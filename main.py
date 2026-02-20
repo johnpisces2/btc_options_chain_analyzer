@@ -6,6 +6,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import ccxt
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -66,6 +68,32 @@ class RefreshResult:
     rows: List[ChainRow]
     source: str
     is_deribit: bool
+
+
+@dataclass
+class StrategyLeg:
+    action: str  # BUY or SELL
+    option_type: str  # CALL or PUT
+    strike: float
+    entry_price: float
+    latest_mark: Optional[float] = None
+    close_price: Optional[float] = None
+
+
+@dataclass
+class StrategyPosition:
+    position_id: int
+    opened_at: str
+    source: str
+    quantity: int
+    open_spot: Optional[float]
+    legs: List[StrategyLeg]
+    entry_cashflow: float
+    last_unrealized_pnl: Optional[float] = None
+    realized_pnl: Optional[float] = None
+    closed_at: str = ""
+    status: str = "OPEN"
+    legacy_import: bool = False
 
 
 class DataFetchWorker(QObject):
@@ -440,13 +468,16 @@ class PricingEngine:
 
 
 class MainWindow(QMainWindow):
+    POSITIONS_FILENAME = "strategy_positions.json"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BTC Options Chain Analyzer")
-        self.resize(1360, 870)
+        self.resize(1460, 960)
         self._base_window_w = 1360
-        self._base_window_h = 870
+        self._base_window_h = 960
         self._ui_scale = 1.0
+        self._font_scale = 0.82
         self._base_table_widths = {
             0: 78,
             1: 88,
@@ -463,6 +494,7 @@ class MainWindow(QMainWindow):
             12: 78,
         }
         self._base_row_height = 44
+        self._base_chain_visible_rows = 13
         self._base_symbol_w = 130
         self._base_horizon_w = 190
         self._base_toggle_w = 190
@@ -472,6 +504,9 @@ class MainWindow(QMainWindow):
         self._last_rows: List[ChainRow] = []
         self._active_row: Optional[int] = None
         self._active_side: Optional[str] = None
+        self._positions: List[StrategyPosition] = []
+        self._next_position_id: int = 1
+        self._positions_file = Path(__file__).resolve().parent / self.POSITIONS_FILENAME
         self._refresh_thread: Optional[QThread] = None
         self._refresh_worker: Optional[DataFetchWorker] = None
         self._expiry_thread: Optional[QThread] = None
@@ -481,6 +516,7 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.refresh_data(manual=False))
 
+        self._load_positions()
         self._build_ui()
         self.refresh_data()
 
@@ -523,7 +559,7 @@ class MainWindow(QMainWindow):
 
         self.wings_spin = QSpinBox()
         self.wings_spin.setRange(3, 30)
-        self.wings_spin.setValue(7)
+        self.wings_spin.setValue(6)
         self.wings_spin.valueChanged.connect(lambda _: self.refresh_data(manual=False))
 
         self.refresh_spin = QSpinBox()
@@ -592,19 +628,108 @@ class MainWindow(QMainWindow):
         info_row.addWidget(self.hook_card)
         info_row.addWidget(self.source_card, 1)
 
+        sim_bar = QFrame()
+        self.sim_bar = sim_bar
+        sim_bar.setObjectName("simBar")
+        sim_layout = QVBoxLayout(sim_bar)
+        sim_layout.setContentsMargins(8, 4, 8, 4)
+        sim_layout.setSpacing(4)
+
+        self.ic_qty_spin = QSpinBox()
+        self.ic_qty_spin.setRange(1, 100)
+        self.ic_qty_spin.setValue(1)
+        self.ic_qty_spin.setFixedWidth(80)
+
+        self.leg_controls: List[Tuple[QComboBox, QComboBox, str]] = []
+        self.leg_titles: List[QLabel] = []
+        leg_grid = QGridLayout()
+        leg_grid.setContentsMargins(0, 0, 0, 0)
+        leg_grid.setHorizontalSpacing(8)
+        leg_grid.setVerticalSpacing(4)
+        left_title = QLabel("Calls")
+        right_title = QLabel("Puts")
+        left_title.setAlignment(Qt.AlignCenter)
+        right_title.setAlignment(Qt.AlignCenter)
+        left_title.setStyleSheet("font-weight: 700; color: #7cd89a;")
+        right_title.setStyleSheet("font-weight: 700; color: #f3a2a9;")
+        self.leg_titles = [left_title, right_title]
+        leg_grid.addWidget(left_title, 0, 0, 1, 2)
+        leg_grid.addWidget(right_title, 0, 2, 1, 2)
+
+        for idx in range(4):
+            action_combo = QComboBox()
+            action_combo.addItems(["", "BUY", "SELL"])
+            strike_combo = QComboBox()
+            strike_combo.addItem("")
+            strike_combo.setMinimumWidth(96)
+            option_type = "CALL" if idx % 2 == 0 else "PUT"
+            self.leg_controls.append((action_combo, strike_combo, option_type))
+            row = 1 + idx // 2
+            col = (idx % 2) * 2
+            leg_grid.addWidget(action_combo, row, col)
+            leg_grid.addWidget(strike_combo, row, col + 1)
+        leg_grid.setColumnStretch(4, 1)
+
+        self.open_ic_btn = QPushButton("Open Strategy")
+        self.open_ic_btn.clicked.connect(self._open_strategy_position)
+        self.close_ic_btn = QPushButton("Close Selected")
+        self.close_ic_btn.clicked.connect(self._close_selected_position)
+        self.delete_ic_btn = QPushButton("Delete Selected")
+        self.delete_ic_btn.clicked.connect(self._delete_selected_position)
+        self.sim_summary_label = QLabel("Unrealized PnL +0.0000 | Realized PnL +0.0000")
+        self.sim_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(8)
+        action_row.addWidget(QLabel("Qty"))
+        action_row.addWidget(self.ic_qty_spin)
+        action_row.addWidget(self.open_ic_btn)
+        action_row.addWidget(self.close_ic_btn)
+        action_row.addWidget(self.delete_ic_btn)
+        action_row.addStretch(1)
+        action_row.addWidget(self.sim_summary_label, 1)
+
+        sim_layout.addLayout(leg_grid)
+        sim_layout.addLayout(action_row)
+
+        self.pos_table = QTableWidget(0, 9)
+        self.pos_table.setObjectName("posTable")
+        self.pos_table.setHorizontalHeaderLabels(
+            [
+                "ID",
+                "Status",
+                "Qty",
+                "Open Px",
+                "Puts",
+                "Calls",
+                "Entry Net",
+                "PnL",
+                "Opened",
+            ]
+        )
+        self.pos_table.verticalHeader().setVisible(False)
+        self.pos_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.pos_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.pos_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.pos_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.pos_table.setFocusPolicy(Qt.NoFocus)
+
         chain_header = QHBoxLayout()
-        calls_title = QLabel("Calls")
-        calls_title.setAlignment(Qt.AlignCenter)
-        calls_title.setStyleSheet("font-weight: 700; color: #7cd89a; font-size: 14px;")
-        strike_title = QLabel("Strike")
-        strike_title.setAlignment(Qt.AlignCenter)
-        strike_title.setStyleSheet("font-weight: 700; color: #d8deed; font-size: 14px;")
-        puts_title = QLabel("Puts")
-        puts_title.setAlignment(Qt.AlignCenter)
-        puts_title.setStyleSheet("font-weight: 700; color: #f3a2a9; font-size: 14px;")
-        chain_header.addWidget(calls_title, 6)
-        chain_header.addWidget(strike_title, 1)
-        chain_header.addWidget(puts_title, 6)
+        chain_header.setContentsMargins(0, 0, 0, 0)
+        chain_header.setSpacing(0)
+        self.calls_title = QLabel("Calls")
+        self.calls_title.setAlignment(Qt.AlignCenter)
+        self.calls_title.setStyleSheet("font-weight: 700; color: #7cd89a;")
+        self.strike_title = QLabel("Strike")
+        self.strike_title.setAlignment(Qt.AlignCenter)
+        self.strike_title.setStyleSheet("font-weight: 700; color: #d8deed;")
+        self.puts_title = QLabel("Puts")
+        self.puts_title.setAlignment(Qt.AlignCenter)
+        self.puts_title.setStyleSheet("font-weight: 700; color: #f3a2a9;")
+        chain_header.addWidget(self.calls_title, 6)
+        chain_header.addWidget(self.strike_title, 1)
+        chain_header.addWidget(self.puts_title, 6)
 
         self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels(
@@ -631,13 +756,17 @@ class MainWindow(QMainWindow):
         self.table.cellClicked.connect(self._on_table_cell_clicked)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.setWordWrap(True)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._apply_table_widths()
 
         layout.addWidget(top_bar)
         layout.addLayout(info_row)
         layout.addLayout(chain_header)
-        layout.addWidget(self.table)
+        layout.addWidget(self.table, 3)
+        layout.addWidget(sim_bar)
+        layout.addWidget(self.pos_table, 1)
 
+        self._refresh_positions_table()
         self._on_mode_changed(self.deribit_check.isChecked())
         self._apply_ui_scale(force=True)
         self._toggle_timer(True)
@@ -837,6 +966,9 @@ class MainWindow(QMainWindow):
             self.hook_label.setText("--")
 
         self._populate_table(rows)
+        self._refresh_leg_strike_options(rows)
+        self._mark_positions_to_market(rows)
+        self._refresh_positions_table()
 
     def _set_open_headers(self, deribit_mode: bool):
         left = "Open Int" if deribit_mode else "ITM Prob"
@@ -868,6 +1000,377 @@ class MainWindow(QMainWindow):
             self._fmt_open(row.put_open),
         ]
 
+    @staticmethod
+    def _fmt_price(value: Optional[float]) -> str:
+        if value is None:
+            return "--"
+        return f"{value:,.4f}"
+
+    @staticmethod
+    def _fmt_price_int(value: Optional[float]) -> str:
+        if value is None:
+            return "--"
+        return f"{value:,.0f}"
+
+    @staticmethod
+    def _fmt_pnl(value: Optional[float]) -> str:
+        if value is None:
+            return "--"
+        return f"{value:+,.4f}"
+
+    def _build_strike_map(self) -> Dict[float, ChainRow]:
+        return {float(row.strike): row for row in self._last_rows}
+
+    @staticmethod
+    def _leg_sign(action: str) -> int:
+        return 1 if action == "BUY" else -1
+
+    @staticmethod
+    def _leg_bucket_key(leg: StrategyLeg) -> Tuple[str, str]:
+        return leg.action.upper(), leg.option_type.upper()
+
+    @staticmethod
+    def _quote_from_row(row: ChainRow, option_type: str) -> Tuple[float, float, float]:
+        if option_type == "CALL":
+            return row.call_bid, row.call_ask, row.call_mark
+        return row.put_bid, row.put_ask, row.put_mark
+
+    def _refresh_leg_strike_options(self, rows: List[ChainRow]):
+        strikes = [f"{row.strike:,.0f}" for row in rows]
+        for _, strike_combo, _ in self.leg_controls:
+            current_text = strike_combo.currentText()
+            strike_combo.blockSignals(True)
+            strike_combo.clear()
+            strike_combo.addItem("")
+            if strikes:
+                strike_combo.addItems(strikes)
+            if current_text and current_text in strikes:
+                idx = strike_combo.findText(current_text)
+                if idx >= 0:
+                    strike_combo.setCurrentIndex(idx)
+            else:
+                strike_combo.setCurrentIndex(0)
+            strike_combo.blockSignals(False)
+
+    def _mark_positions_to_market(self, rows: List[ChainRow]):
+        strike_map = {float(row.strike): row for row in rows}
+        for position in self._positions:
+            if position.status != "OPEN":
+                continue
+            if position.legacy_import:
+                continue
+            leg_pnl = 0.0
+            complete = True
+            for leg in position.legs:
+                row = strike_map.get(float(leg.strike))
+                if row is None:
+                    complete = False
+                    break
+                _, _, mark = self._quote_from_row(row, leg.option_type)
+                leg.latest_mark = mark
+                leg_pnl += self._leg_sign(leg.action) * (mark - leg.entry_price)
+            position.last_unrealized_pnl = leg_pnl * position.quantity if complete else None
+
+    def _open_strategy_position(self):
+        if not self._last_rows:
+            QMessageBox.warning(self, "Open Strategy Failed", "No option chain data to build strategy.")
+            return
+
+        strike_map = self._build_strike_map()
+        quantity = int(self.ic_qty_spin.value())
+        legs: List[StrategyLeg] = []
+        entry_cashflow = 0.0
+        try:
+            for action_combo, strike_combo, option_type in self.leg_controls:
+                action = action_combo.currentText().strip().upper()
+                strike_text = strike_combo.currentText().replace(",", "").strip()
+                if not action and not strike_text:
+                    continue
+                if not action or not strike_text:
+                    raise ValueError("Each used leg must select BUY/SELL and Strike.")
+                strike = float(strike_text)
+                row = strike_map.get(strike)
+                if row is None:
+                    raise ValueError(f"Strike {strike:,.0f} is not in current chain.")
+                bid, ask, mark = self._quote_from_row(row, option_type)
+                entry_price = ask if action == "BUY" else bid
+                if entry_price <= 0:
+                    raise ValueError(f"{action} {option_type} {strike:,.0f} has invalid quote.")
+                entry_cashflow += (-self._leg_sign(action) * entry_price)
+                legs.append(
+                    StrategyLeg(
+                        action=action,
+                        option_type=option_type,
+                        strike=strike,
+                        entry_price=entry_price,
+                        latest_mark=mark,
+                    )
+                )
+            if not legs:
+                raise ValueError("Please configure at least one leg.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Strategy Failed", str(exc))
+            return
+
+        spot_text = self.spot_label.text().strip()
+        open_spot: Optional[float] = None
+        try:
+            open_spot = float(spot_text.split(" ")[0].replace(",", ""))
+        except Exception:
+            open_spot = None
+
+        now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        position = StrategyPosition(
+            position_id=self._next_position_id,
+            opened_at=now,
+            source=self.source_label.text().strip(),
+            quantity=quantity,
+            open_spot=open_spot,
+            legs=legs,
+            entry_cashflow=entry_cashflow,
+        )
+        self._next_position_id += 1
+        self._positions.append(position)
+        self._mark_positions_to_market(self._last_rows)
+        self._save_positions()
+        self._refresh_positions_table()
+
+    def _selected_position_rows(self) -> List[int]:
+        model = self.pos_table.selectionModel()
+        if model is None:
+            return []
+        return sorted({idx.row() for idx in model.selectedRows()})
+
+    def _close_selected_position(self):
+        selected_rows = self._selected_position_rows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Close Failed", "Please select one or more simulated positions first.")
+            return
+        changed = False
+        for row in selected_rows:
+            if 0 <= row < len(self._positions):
+                changed = self._close_position(self._positions[row], persist=False) or changed
+        if changed:
+            self._save_positions()
+        self._refresh_positions_table()
+
+    def _delete_selected_position(self):
+        selected_rows = self._selected_position_rows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Delete Failed", "Please select one or more simulated positions first.")
+            return
+        for row in sorted(selected_rows, reverse=True):
+            if 0 <= row < len(self._positions):
+                del self._positions[row]
+        self._save_positions()
+        self._refresh_positions_table()
+
+    def _close_position(self, position: StrategyPosition, persist: bool = True) -> bool:
+        if position.status != "OPEN":
+            return False
+        if position.legacy_import:
+            QMessageBox.warning(
+                self,
+                "Close Failed",
+                f"Position #{position.position_id} is a legacy record with unknown leg entry prices.",
+            )
+            return False
+        strike_map = self._build_strike_map()
+        leg_pnl = 0.0
+        for leg in position.legs:
+            row = strike_map.get(float(leg.strike))
+            if row is None:
+                QMessageBox.warning(
+                    self,
+                    "Close Failed",
+                    f"Position #{position.position_id} legs are not in current chain window.",
+                )
+                return False
+            _, _, mark = self._quote_from_row(row, leg.option_type)
+            leg.close_price = mark
+            leg_pnl += self._leg_sign(leg.action) * (mark - leg.entry_price)
+        position.realized_pnl = leg_pnl * position.quantity
+        position.last_unrealized_pnl = position.realized_pnl
+        position.status = "CLOSED"
+        position.closed_at = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        if persist:
+            self._save_positions()
+        return True
+
+    def _refresh_positions_table(self):
+        self.pos_table.setRowCount(len(self._positions))
+        unrealized = 0.0
+        realized = 0.0
+        for idx, position in enumerate(self._positions):
+            pnl_value: Optional[float]
+            if position.status == "OPEN":
+                pnl_value = position.last_unrealized_pnl
+                if pnl_value is not None:
+                    unrealized += pnl_value
+            else:
+                pnl_value = position.realized_pnl
+                if pnl_value is not None:
+                    realized += pnl_value
+
+            leg_buckets: Dict[Tuple[str, str], List[str]] = {
+                ("BUY", "PUT"): [],
+                ("SELL", "PUT"): [],
+                ("BUY", "CALL"): [],
+                ("SELL", "CALL"): [],
+            }
+            for leg in position.legs:
+                key = self._leg_bucket_key(leg)
+                if key in leg_buckets:
+                    leg_buckets[key].append(f"{leg.strike:,.0f}")
+            puts_text_parts: List[str] = []
+            calls_text_parts: List[str] = []
+            if leg_buckets[("BUY", "PUT")]:
+                puts_text_parts.append(f"B:{'/'.join(leg_buckets[('BUY', 'PUT')])}")
+            if leg_buckets[("SELL", "PUT")]:
+                puts_text_parts.append(f"S:{'/'.join(leg_buckets[('SELL', 'PUT')])}")
+            if leg_buckets[("SELL", "CALL")]:
+                calls_text_parts.append(f"S:{'/'.join(leg_buckets[('SELL', 'CALL')])}")
+            if leg_buckets[("BUY", "CALL")]:
+                calls_text_parts.append(f"B:{'/'.join(leg_buckets[('BUY', 'CALL')])}")
+            values = [
+                str(position.position_id),
+                position.status,
+                str(position.quantity),
+                self._fmt_price_int(position.open_spot),
+                " ".join(puts_text_parts) or "--",
+                " ".join(calls_text_parts) or "--",
+                self._fmt_price(position.entry_cashflow * position.quantity),
+                self._fmt_pnl(pnl_value),
+                position.opened_at,
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignCenter)
+                if col == 7 and pnl_value is not None:
+                    item.setForeground(QColor("#00d37f" if pnl_value >= 0 else "#ff6378"))
+                self.pos_table.setItem(idx, col, item)
+
+        total = unrealized + realized
+        self.sim_summary_label.setText(
+            f"Unrealized PnL {unrealized:+.4f} | Realized PnL {realized:+.4f} | Total {total:+.4f}"
+        )
+
+    def _position_to_dict(self, position: StrategyPosition) -> dict:
+        return {
+            "position_id": position.position_id,
+            "opened_at": position.opened_at,
+            "source": position.source,
+            "quantity": position.quantity,
+            "open_spot": position.open_spot,
+            "entry_cashflow": position.entry_cashflow,
+            "last_unrealized_pnl": position.last_unrealized_pnl,
+            "realized_pnl": position.realized_pnl,
+            "closed_at": position.closed_at,
+            "status": position.status,
+            "legacy_import": position.legacy_import,
+            "legs": [
+                {
+                    "action": leg.action,
+                    "option_type": leg.option_type,
+                    "strike": leg.strike,
+                    "entry_price": leg.entry_price,
+                    "latest_mark": leg.latest_mark,
+                    "close_price": leg.close_price,
+                }
+                for leg in position.legs
+            ],
+        }
+
+    def _position_from_dict(self, data: dict) -> StrategyPosition:
+        legs_data = data.get("legs", [])
+        legacy_import = False
+        legs: List[StrategyLeg] = []
+        if isinstance(legs_data, list) and legs_data:
+            for raw in legs_data:
+                if not isinstance(raw, dict):
+                    continue
+                legs.append(
+                    StrategyLeg(
+                        action=str(raw.get("action", "BUY")).upper(),
+                        option_type=str(raw.get("option_type", "CALL")).upper(),
+                        strike=float(raw.get("strike", 0.0)),
+                        entry_price=float(raw.get("entry_price", 0.0)),
+                        latest_mark=(None if raw.get("latest_mark") is None else float(raw.get("latest_mark"))),
+                        close_price=(None if raw.get("close_price") is None else float(raw.get("close_price"))),
+                    )
+                )
+        else:
+            legacy_import = True
+            short_put = float(data.get("short_put", 0.0))
+            long_put = float(data.get("long_put", 0.0))
+            short_call = float(data.get("short_call", 0.0))
+            long_call = float(data.get("long_call", 0.0))
+            legs = [
+                StrategyLeg("SELL", "PUT", short_put, 0.0),
+                StrategyLeg("BUY", "PUT", long_put, 0.0),
+                StrategyLeg("SELL", "CALL", short_call, 0.0),
+                StrategyLeg("BUY", "CALL", long_call, 0.0),
+            ]
+
+        parsed_status = str(data.get("status", "OPEN"))
+        parsed_qty = int(data.get("quantity", 1))
+        parsed_realized = (None if data.get("realized_pnl") is None else float(data.get("realized_pnl")))
+        parsed_unrealized = (None if data.get("last_unrealized_pnl") is None else float(data.get("last_unrealized_pnl")))
+        if legacy_import and parsed_unrealized is None and parsed_status == "OPEN":
+            legacy_entry_credit = data.get("entry_credit")
+            legacy_last_close = data.get("last_close_debit")
+            if legacy_entry_credit is not None and legacy_last_close is not None:
+                try:
+                    parsed_unrealized = (float(legacy_entry_credit) - float(legacy_last_close)) * parsed_qty
+                except Exception:
+                    parsed_unrealized = None
+
+        return StrategyPosition(
+            position_id=int(data.get("position_id", 0)),
+            opened_at=str(data.get("opened_at", "")),
+            source=str(data.get("source", "")),
+            quantity=parsed_qty,
+            open_spot=(None if data.get("open_spot") is None else float(data.get("open_spot"))),
+            legs=legs,
+            entry_cashflow=float(data.get("entry_cashflow", data.get("entry_credit", 0.0))),
+            last_unrealized_pnl=parsed_unrealized,
+            realized_pnl=parsed_realized,
+            closed_at=str(data.get("closed_at", "")),
+            status=parsed_status,
+            legacy_import=bool(data.get("legacy_import", False)) or legacy_import,
+        )
+
+    def _load_positions(self):
+        if not self._positions_file.exists():
+            return
+        try:
+            payload = json.loads(self._positions_file.read_text(encoding="utf-8"))
+            raw_positions = payload.get("positions", [])
+            self._positions = [self._position_from_dict(item) for item in raw_positions if isinstance(item, dict)]
+            configured_next = int(payload.get("next_position_id", 1))
+            max_seen_id = max((p.position_id for p in self._positions), default=0)
+            self._next_position_id = max(configured_next, max_seen_id + 1, 1)
+        except Exception as exc:
+            print(f"Failed to load positions file: {exc}", file=sys.stderr)
+            self._positions = []
+            self._next_position_id = 1
+
+    def _save_positions(self):
+        if not self._positions:
+            self._next_position_id = 1
+            if self._positions_file.exists():
+                self._positions_file.unlink()
+            return
+
+        payload = {
+            "next_position_id": self._next_position_id,
+            "positions": [self._position_to_dict(p) for p in self._positions],
+            "updated_at": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        tmp_path = self._positions_file.with_suffix(self._positions_file.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp_path.replace(self._positions_file)
+
     def _repaint_row(self, row_idx: int):
         if row_idx < 0 or row_idx >= len(self._last_rows):
             return
@@ -879,7 +1382,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(row_idx, c, item)
 
     def _s(self, value: int) -> int:
-        return max(1, int(round(value * self._ui_scale)))
+        return max(1, int(round(value * self._ui_scale * self._font_scale)))
 
     def _apply_ui_scale(self, force: bool = False):
         if self._base_window_w <= 0 or self._base_window_h <= 0:
@@ -902,13 +1405,23 @@ class MainWindow(QMainWindow):
         self.horizon_stack.setFixedHeight(self._s(30))
         self.wings_spin.setFixedSize(self._s(70), self._s(30))
         self.refresh_spin.setFixedSize(self._s(70), self._s(30))
+        self.ic_qty_spin.setFixedSize(self._s(80), self._s(30))
+        title_font_px = self._s(12)
+        for title in self.leg_titles:
+            title.setStyleSheet(f"font-weight: 700; font-size: {title_font_px}px;")
+        if len(self.leg_titles) >= 2:
+            self.leg_titles[0].setStyleSheet(f"font-weight: 700; color: #7cd89a; font-size: {title_font_px}px;")
+            self.leg_titles[1].setStyleSheet(f"font-weight: 700; color: #f3a2a9; font-size: {title_font_px}px;")
+        for action_combo, strike_combo, _ in self.leg_controls:
+            action_combo.setFixedSize(self._s(110), self._s(30))
+            strike_combo.setFixedSize(self._s(134), self._s(30))
         deribit_w = self.deribit_check.sizeHint().width() + self._s(12)
         auto_w = self.auto_check.sizeHint().width() + self._s(12)
         self.deribit_check.setMinimumWidth(deribit_w)
         self.deribit_check.setMaximumWidth(16777215)
         self.auto_check.setMinimumWidth(auto_w)
         self.auto_check.setMaximumWidth(16777215)
-        self.reload_expiry_btn.setFixedSize(self._s(92), self._s(30))
+        self.reload_expiry_btn.setFixedSize(self._s(128), self._s(30))
         min_toggle_w = (
             self.deribit_check.sizeHint().width()
             + self.auto_check.sizeHint().width()
@@ -916,6 +1429,21 @@ class MainWindow(QMainWindow):
         )
         self.toggle_box.setFixedSize(max(self._s(self._base_toggle_w), min_toggle_w), self._s(34))
         self.refresh_btn.setFixedSize(self._s(90), self._s(34))
+        self.open_ic_btn.setFixedSize(self._s(140), self._s(34))
+        self.close_ic_btn.setFixedSize(self._s(170), self._s(34))
+        self.delete_ic_btn.setFixedSize(self._s(176), self._s(34))
+        self.sim_bar.setMinimumHeight(self._s(112))
+        self.sim_bar.setMaximumHeight(self._s(148))
+        self.pos_table.setMinimumHeight(self._s(120))
+        self.pos_table.setMaximumHeight(self._s(200))
+        title_h = self._s(14)
+        title_font_px = self._s(12)
+        self.calls_title.setFixedHeight(title_h)
+        self.strike_title.setFixedHeight(title_h)
+        self.puts_title.setFixedHeight(title_h)
+        self.calls_title.setStyleSheet(f"font-weight: 700; color: #7cd89a; font-size: {title_font_px}px;")
+        self.strike_title.setStyleSheet(f"font-weight: 700; color: #d8deed; font-size: {title_font_px}px;")
+        self.puts_title.setStyleSheet(f"font-weight: 700; color: #f3a2a9; font-size: {title_font_px}px;")
 
         for card in (self.time_card, self.spot_card, self.iv_card, self.hook_card):
             base_w = int(card.property("baseWidth") or 200)
@@ -925,8 +1453,14 @@ class MainWindow(QMainWindow):
         self.source_card.setMaximumWidth(16777215)
 
         self._apply_table_widths()
+        scaled_row_h = self._s(self._base_row_height)
         for i in range(self.table.rowCount()):
-            self.table.setRowHeight(i, self._s(self._base_row_height))
+            self.table.setRowHeight(i, scaled_row_h)
+        header_h = self.table.horizontalHeader().height()
+        frame_h = self.table.frameWidth() * 2
+        target_table_h = header_h + scaled_row_h * self._base_chain_visible_rows + frame_h + self._s(2)
+        self.table.setMinimumHeight(target_table_h)
+        self.table.setMaximumHeight(target_table_h)
         self._apply_dark_theme()
 
     def resizeEvent(self, event):
@@ -1038,6 +1572,9 @@ class MainWindow(QMainWindow):
                 background-color: #0c1016;
                 color: #d4dbeb;
             }}
+            QLabel {{
+                background-color: transparent;
+            }}
             #topBar {{
                 background-color: #0f1621;
                 border: 1px solid #283243;
@@ -1046,6 +1583,11 @@ class MainWindow(QMainWindow):
             #toggleBox {{
                 background-color: #121c2b;
                 border: 1px solid #2d3d58;
+                border-radius: {border_radius}px;
+            }}
+            #simBar {{
+                background-color: #101726;
+                border: 1px solid #283243;
                 border-radius: {border_radius}px;
             }}
             #infoCard {{
@@ -1062,7 +1604,7 @@ class MainWindow(QMainWindow):
                 font-size: {card_value_size}px;
                 font-weight: 600;
             }}
-            QLineEdit, QSpinBox {{
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
                 background-color: #121826;
                 border: 1px solid #31405a;
                 border-radius: {line_radius}px;
@@ -1097,6 +1639,14 @@ class MainWindow(QMainWindow):
                 gridline-color: #273041;
                 selection-background-color: #2a3a56;
                 selection-color: #ffffff;
+            }}
+            QTableWidget::item:selected {{
+                background-color: transparent;
+                color: inherit;
+            }}
+            #posTable::item:selected {{
+                background-color: #2a3a56;
+                color: #ffffff;
             }}
             """
         )
