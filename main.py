@@ -250,6 +250,7 @@ class DeribitAnalyzer:
         if cached and now_monotonic - cached[0] < 120.0:
             return cached[1]
 
+        # Fetch 1Y data for percentile calculation
         points = self.iv_history.fetch_dvol_index_history(timeframe_days=lookback_days, resolution="1D")
         if not points:
             raise ValueError("No volatility-index data from Deribit")
@@ -258,7 +259,17 @@ class DeribitAnalyzer:
 
         current_val = points[-1].iv
         percentile = self.iv_history.calculate_percentile(points, current_value=current_val)
-        text = f"DVOL {current_val:.2f} ({percentile:.1f}%, 1Y)"
+
+        # Fetch 30D data for high/low calculation
+        points_30d = self.iv_history.fetch_dvol_index_history(timeframe_days=30, resolution="1D")
+        if points_30d:
+            iv_values_30d = [p.iv for p in points_30d]
+            iv_high_30d = max(iv_values_30d)
+            iv_low_30d = min(iv_values_30d)
+            text = f"DVOL {current_val:.2f} ({percentile:.1f}%, 1Y) | 30D High: {iv_high_30d:.2f} Low: {iv_low_30d:.2f}"
+        else:
+            text = f"DVOL {current_val:.2f} ({percentile:.1f}%, 1Y)"
+
         self._VOL_PERCENTILE_CACHE[cache_key] = (now_monotonic, text)
         return text
 
@@ -623,7 +634,7 @@ class MainWindow(QMainWindow):
 
         self.time_card = self._make_info_card("Time", self.time_label, 205)
         self.spot_card = self._make_info_card("Spot", self.spot_label, 150)
-        self.iv_card = self._make_info_card("IV", self.iv_label, 300)
+        self.iv_card = self._make_info_card("IV", self.iv_label, 380)
         self.hook_card = self._make_info_card("ATM Annual (Bid)", self.hook_label, 280)
         self.source_card = self._make_info_card("Source", self.source_label, 420)
         self.source_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
