@@ -5,7 +5,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -97,6 +97,44 @@ class StrategyPosition:
     legacy_import: bool = False
 
 
+@dataclass
+class BacktestStatsResult:
+    start_utc: datetime
+    end_utc: datetime
+    sample_count: int
+    settlement_count: int
+    avg_price: float
+    std_price: float
+    lower_2sigma: float
+    upper_2sigma: float
+    base_price: float
+
+
+def _parse_local_datetime_input(raw_text: str, end_of_day_for_date: bool) -> datetime:
+    text = raw_text.strip()
+    if not text:
+        raise ValueError("Please input both start and end time.")
+
+    date_only_formats = ("%Y-%m-%d", "%Y/%m/%d")
+    all_formats = ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", *date_only_formats)
+    parsed: Optional[datetime] = None
+    used_date_only = False
+    for fmt in all_formats:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            used_date_only = fmt in date_only_formats
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        raise ValueError("Invalid time format. Use YYYY-MM-DD or YYYY-MM-DD HH:MM.")
+
+    if used_date_only and end_of_day_for_date:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+    return parsed.replace(tzinfo=local_tz).astimezone(timezone.utc)
+
+
 class DataFetchWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
@@ -175,6 +213,15 @@ class ExpiryLoadWorker(QObject):
 
 
 class MarketAnalyzer:
+    _TIMEFRAME_TO_MS = {
+        "1m": 60_000,
+        "5m": 5 * 60_000,
+        "15m": 15 * 60_000,
+        "1h": 60 * 60_000,
+        "4h": 4 * 60 * 60_000,
+        "1d": 24 * 60 * 60_000,
+    }
+
     def __init__(self, exchange_id: str, symbol: str):
         self.exchange_id = exchange_id
         self.symbol = symbol
@@ -200,6 +247,135 @@ class MarketAnalyzer:
         log_returns_30 = log_returns[-30:]
         daily_std = np.std(log_returns_30, ddof=1)
         return float(daily_std * math.sqrt(TRADING_DAYS))
+
+    @classmethod
+    def _timeframe_to_ms(cls, timeframe: str) -> int:
+        step = cls._TIMEFRAME_TO_MS.get(timeframe)
+        if step is None:
+            raise ValueError(f"Unsupported timeframe: {timeframe}")
+        return step
+
+    def fetch_close_series(
+        self, start_utc: datetime, end_utc: datetime, timeframe: str = "1h"
+    ) -> List[Tuple[int, float]]:
+        start_ms = int(start_utc.timestamp() * 1000)
+        end_ms = int(end_utc.timestamp() * 1000)
+        if end_ms <= start_ms:
+            raise ValueError("End time must be later than start time.")
+
+        step_ms = self._timeframe_to_ms(timeframe)
+        since = start_ms
+        series: List[Tuple[int, float]] = []
+        last_seen_ts = -1
+        limit = 1000
+
+        while since < end_ms:
+            batch = self.exchange.fetch_ohlcv(self.symbol, timeframe=timeframe, since=since, limit=limit)
+            if not batch:
+                break
+            for candle in batch:
+                ts = int(candle[0])
+                if ts < start_ms:
+                    continue
+                if ts >= end_ms:
+                    break
+                if ts <= last_seen_ts:
+                    continue
+                series.append((ts, float(candle[4])))
+                last_seen_ts = ts
+            batch_last_ts = int(batch[-1][0])
+            next_since = batch_last_ts + step_ms
+            if next_since <= since:
+                break
+            since = next_since
+            if batch_last_ts >= end_ms:
+                break
+            if len(batch) < limit:
+                break
+
+        return series
+
+    def fetch_close_prices(self, start_utc: datetime, end_utc: datetime, timeframe: str = "1h") -> List[float]:
+        return [close for _, close in self.fetch_close_series(start_utc=start_utc, end_utc=end_utc, timeframe=timeframe)]
+
+
+class BacktestStatsWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, symbol: str, start_text: str, end_text: str, timeframe: str = "1h"):
+        super().__init__()
+        self.symbol = symbol
+        self.start_text = start_text
+        self.end_text = end_text
+        self.timeframe = timeframe
+
+    @staticmethod
+    def _first_weekly_settlement_anchor(start_utc: datetime) -> datetime:
+        # Deribit weekly settlement anchor: Friday 08:00 UTC.
+        anchor = start_utc.astimezone(timezone.utc).replace(hour=8, minute=0, second=0, microsecond=0)
+        days_to_friday = (4 - anchor.weekday()) % 7
+        anchor = anchor + timedelta(days=days_to_friday)
+        if anchor < start_utc:
+            anchor = anchor + timedelta(days=7)
+        return anchor
+
+    @classmethod
+    def _sample_weekly_settlement_prices(
+        cls, series: List[Tuple[int, float]], start_utc: datetime, end_utc: datetime
+    ) -> List[float]:
+        if not series:
+            return []
+        prices: List[float] = []
+        idx = 0
+        n = len(series)
+        anchor = cls._first_weekly_settlement_anchor(start_utc)
+        end_ms = int(end_utc.timestamp() * 1000)
+
+        while anchor.timestamp() * 1000 <= end_ms:
+            anchor_ms = int(anchor.timestamp() * 1000)
+            while idx < n and series[idx][0] < anchor_ms:
+                idx += 1
+            if idx >= n:
+                break
+            prices.append(series[idx][1])
+            anchor = anchor + timedelta(days=7)
+        return prices
+
+    @Slot()
+    def run(self):
+        try:
+            start_utc = _parse_local_datetime_input(self.start_text, end_of_day_for_date=False)
+            end_utc = _parse_local_datetime_input(self.end_text, end_of_day_for_date=True)
+            analyzer = MarketAnalyzer(exchange_id="binance", symbol=self.symbol)
+            series = analyzer.fetch_close_series(start_utc=start_utc, end_utc=end_utc, timeframe=self.timeframe)
+            if len(series) < 2:
+                raise ValueError("Not enough candles in selected range. Please widen the time window.")
+
+            settlement_prices = self._sample_weekly_settlement_prices(series, start_utc=start_utc, end_utc=end_utc)
+            if len(settlement_prices) < 3:
+                raise ValueError("Need at least 3 weekly settlement samples in range for weekly-ratio stats.")
+            prices = np.array(settlement_prices, dtype=float)
+            returns = np.diff(prices) / prices[:-1]
+            mean_ret = float(np.mean(returns))
+            std_ret = float(np.std(returns, ddof=1))
+            base_price = float(prices[-1])
+            lower_mult = max(0.0, 1.0 + mean_ret - 2.0 * std_ret)
+            upper_mult = max(0.0, 1.0 + mean_ret + 2.0 * std_ret)
+            result = BacktestStatsResult(
+                start_utc=start_utc,
+                end_utc=end_utc,
+                sample_count=len(returns),
+                settlement_count=len(settlement_prices),
+                avg_price=mean_ret,
+                std_price=std_ret,
+                lower_2sigma=base_price * lower_mult,
+                upper_2sigma=base_price * upper_mult,
+                base_price=base_price,
+            )
+            self.finished.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class DeribitAnalyzer:
@@ -503,6 +679,9 @@ class MainWindow(QMainWindow):
         self._refresh_worker: Optional[DataFetchWorker] = None
         self._expiry_thread: Optional[QThread] = None
         self._expiry_worker: Optional[ExpiryLoadWorker] = None
+        self._backtest_thread: Optional[QThread] = None
+        self._backtest_worker: Optional[BacktestStatsWorker] = None
+        self._last_backtest_result: Optional[BacktestStatsResult] = None
         self._last_error_popup_ts: float = 0.0
 
         self.timer = QTimer(self)
@@ -626,8 +805,8 @@ class MainWindow(QMainWindow):
         self.sim_bar = sim_bar
         sim_bar.setObjectName("simBar")
         sim_layout = QVBoxLayout(sim_bar)
-        sim_layout.setContentsMargins(8, 4, 8, 4)
-        sim_layout.setSpacing(4)
+        sim_layout.setContentsMargins(8, 3, 8, 3)
+        sim_layout.setSpacing(2)
 
         self.ic_qty_spin = QSpinBox()
         self.ic_qty_spin.setRange(1, 100)
@@ -639,7 +818,7 @@ class MainWindow(QMainWindow):
         leg_grid = QGridLayout()
         leg_grid.setContentsMargins(0, 0, 0, 0)
         leg_grid.setHorizontalSpacing(8)
-        leg_grid.setVerticalSpacing(4)
+        leg_grid.setVerticalSpacing(2)
         left_title = QLabel("Calls")
         right_title = QLabel("Puts")
         left_title.setAlignment(Qt.AlignCenter)
@@ -653,16 +832,81 @@ class MainWindow(QMainWindow):
         for idx in range(4):
             action_combo = QComboBox()
             action_combo.addItems(["", "BUY", "SELL"])
+            action_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             strike_combo = QComboBox()
             strike_combo.addItem("")
-            strike_combo.setMinimumWidth(96)
+            strike_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             option_type = "CALL" if idx % 2 == 0 else "PUT"
             self.leg_controls.append((action_combo, strike_combo, option_type))
             row = 1 + idx // 2
             col = (idx % 2) * 2
             leg_grid.addWidget(action_combo, row, col)
             leg_grid.addWidget(strike_combo, row, col + 1)
-        leg_grid.setColumnStretch(4, 1)
+        leg_grid.setColumnStretch(0, 1)
+        leg_grid.setColumnStretch(1, 1)
+        leg_grid.setColumnStretch(2, 1)
+        leg_grid.setColumnStretch(3, 1)
+
+        self.backtest_box = QFrame()
+        self.backtest_box.setObjectName("backtestBox")
+        self.backtest_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        backtest_layout = QVBoxLayout(self.backtest_box)
+        backtest_layout.setContentsMargins(10, 8, 10, 8)
+        backtest_layout.setSpacing(4)
+        self.backtest_title = QLabel("Backtest Stats (IC ±2σ)")
+        self.backtest_title.setObjectName("backtestTitle")
+        backtest_layout.addWidget(self.backtest_title)
+
+        self.bt_start_input = QLineEdit()
+        self.bt_start_input.setPlaceholderText("Start YYYY-MM-DD")
+        self.bt_end_input = QLineEdit()
+        self.bt_end_input.setPlaceholderText("End YYYY-MM-DD")
+        today_local = datetime.now(timezone.utc).astimezone().date()
+        self.bt_start_input.setText("2018-01-01")
+        self.bt_end_input.setText(today_local.strftime("%Y-%m-%d"))
+        self.bt_calc_btn = QPushButton("Calc ±2σ")
+        self.bt_calc_btn.clicked.connect(self._calculate_backtest_stats)
+
+        bt_input_row = QHBoxLayout()
+        bt_input_row.setContentsMargins(0, 0, 0, 0)
+        bt_input_row.setSpacing(6)
+        bt_input_row.addWidget(QLabel("週結算(週變動比例)"))
+        bt_input_row.addWidget(QLabel("From"))
+        bt_input_row.addWidget(self.bt_start_input)
+        bt_input_row.addWidget(QLabel("To"))
+        bt_input_row.addWidget(self.bt_end_input)
+        bt_input_row.addWidget(self.bt_calc_btn)
+        backtest_layout.addLayout(bt_input_row)
+
+        bt_grid = QGridLayout()
+        bt_grid.setContentsMargins(0, 0, 0, 0)
+        bt_grid.setHorizontalSpacing(8)
+        bt_grid.setVerticalSpacing(2)
+        self.bt_samples_value = QLabel("--")
+        self.bt_avg_value = QLabel("--")
+        self.bt_std_value = QLabel("--")
+        self.bt_band_value = QLabel("--")
+        self.bt_ref_value = QLabel("Press Calc to get IC reference strikes.")
+        self.bt_ref_value.setWordWrap(True)
+        for value_label in (
+            self.bt_samples_value,
+            self.bt_avg_value,
+            self.bt_std_value,
+            self.bt_band_value,
+            self.bt_ref_value,
+        ):
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bt_grid.addWidget(QLabel("Samples"), 0, 0)
+        bt_grid.addWidget(self.bt_samples_value, 0, 1)
+        bt_grid.addWidget(QLabel("Mean"), 0, 2)
+        bt_grid.addWidget(self.bt_avg_value, 0, 3)
+        bt_grid.addWidget(QLabel("Std"), 1, 0)
+        bt_grid.addWidget(self.bt_std_value, 1, 1)
+        bt_grid.addWidget(QLabel("±2σ Band"), 1, 2)
+        bt_grid.addWidget(self.bt_band_value, 1, 3)
+        bt_grid.addWidget(QLabel("IC Ref"), 2, 0)
+        bt_grid.addWidget(self.bt_ref_value, 2, 1, 1, 3)
+        backtest_layout.addLayout(bt_grid)
 
         self.open_ic_btn = QPushButton("Open Strategy")
         self.open_ic_btn.setMinimumWidth(120)
@@ -675,20 +919,33 @@ class MainWindow(QMainWindow):
         self.delete_ic_btn.clicked.connect(self._delete_selected_position)
         self.sim_summary_label = QLabel("Unrealized PnL +0.0000 | Realized PnL +0.0000")
         self.sim_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.sim_summary_label.setWordWrap(True)
 
-        action_row = QHBoxLayout()
-        action_row.setContentsMargins(0, 0, 0, 0)
-        action_row.setSpacing(8)
-        action_row.addWidget(QLabel("Qty"))
-        action_row.addWidget(self.ic_qty_spin)
-        action_row.addWidget(self.open_ic_btn)
-        action_row.addWidget(self.close_ic_btn)
-        action_row.addWidget(self.delete_ic_btn)
-        action_row.addStretch(1)
-        action_row.addWidget(self.sim_summary_label, 1)
+        action_grid = QGridLayout()
+        action_grid.setContentsMargins(0, 0, 0, 0)
+        action_grid.setHorizontalSpacing(8)
+        action_grid.setVerticalSpacing(2)
+        action_grid.addWidget(QLabel("Qty"), 0, 0)
+        action_grid.addWidget(self.ic_qty_spin, 0, 1)
+        action_grid.addWidget(self.open_ic_btn, 0, 2)
+        action_grid.addWidget(self.close_ic_btn, 0, 3)
+        action_grid.addWidget(self.delete_ic_btn, 0, 4)
+        action_grid.setRowStretch(1, 1)
+        action_grid.addWidget(self.sim_summary_label, 2, 2, 1, 3)
+        action_grid.setColumnStretch(5, 1)
 
-        sim_layout.addLayout(leg_grid)
-        sim_layout.addLayout(action_row)
+        left_panel = QVBoxLayout()
+        left_panel.setContentsMargins(0, 0, 0, 0)
+        left_panel.setSpacing(2)
+        left_panel.addLayout(leg_grid)
+        left_panel.addLayout(action_grid, 1)
+
+        sim_main_row = QHBoxLayout()
+        sim_main_row.setContentsMargins(0, 0, 0, 0)
+        sim_main_row.setSpacing(10)
+        sim_main_row.addLayout(left_panel, 4)
+        sim_main_row.addWidget(self.backtest_box, 7)
+        sim_layout.addLayout(sim_main_row)
 
         self.pos_table = QTableWidget(0, 9)
         self.pos_table.setObjectName("posTable")
@@ -966,6 +1223,113 @@ class MainWindow(QMainWindow):
         self._refresh_leg_strike_options(rows)
         self._mark_positions_to_market(rows)
         self._refresh_positions_table()
+        if self._last_backtest_result is not None:
+            self._update_backtest_reference_text(
+                lower_2sigma=self._last_backtest_result.lower_2sigma,
+                upper_2sigma=self._last_backtest_result.upper_2sigma,
+            )
+
+    def _calculate_backtest_stats(self):
+        if self._backtest_thread and self._backtest_thread.isRunning():
+            return
+        symbol = self.symbol_input.text().strip()
+        if not symbol:
+            QMessageBox.warning(self, "Backtest Failed", "Please input a valid symbol first.")
+            return
+        start_text = self.bt_start_input.text().strip()
+        end_text = self.bt_end_input.text().strip()
+        if not start_text or not end_text:
+            QMessageBox.warning(self, "Backtest Failed", "Please input both start and end time.")
+            return
+
+        self.bt_calc_btn.setEnabled(False)
+        self.bt_ref_value.setText("Calculating...")
+        self._backtest_thread = QThread(self)
+        self._backtest_worker = BacktestStatsWorker(
+            symbol=symbol,
+            start_text=start_text,
+            end_text=end_text,
+            timeframe="1h",
+        )
+        self._backtest_worker.moveToThread(self._backtest_thread)
+        self._backtest_thread.started.connect(self._backtest_worker.run)
+        self._backtest_worker.finished.connect(self._on_backtest_success)
+        self._backtest_worker.failed.connect(self._on_backtest_failed)
+        self._backtest_worker.finished.connect(self._cleanup_backtest_worker)
+        self._backtest_worker.failed.connect(self._cleanup_backtest_worker)
+        self._backtest_thread.start()
+
+    @staticmethod
+    def _pick_ic_reference_rows(
+        rows: List[ChainRow], lower_2sigma: float, upper_2sigma: float
+    ) -> Tuple[Optional[ChainRow], Optional[ChainRow], bool, bool]:
+        if not rows:
+            return None, None, False, False
+        ordered = sorted(rows, key=lambda x: x.strike)
+        put_candidates = [row for row in ordered if row.strike <= lower_2sigma]
+        call_candidates = [row for row in ordered if row.strike >= upper_2sigma]
+        put_row = put_candidates[-1] if put_candidates else ordered[0]
+        call_row = call_candidates[0] if call_candidates else ordered[-1]
+        lower_outside = put_row.strike > lower_2sigma
+        upper_outside = call_row.strike < upper_2sigma
+        return put_row, call_row, lower_outside, upper_outside
+
+    def _update_backtest_reference_text(self, lower_2sigma: float, upper_2sigma: float):
+        if not self._last_rows:
+            self.bt_ref_value.setText("Refresh option chain first to map ±2σ to strike references.")
+            return
+        put_row, call_row, lower_outside, upper_outside = self._pick_ic_reference_rows(
+            self._last_rows,
+            lower_2sigma=lower_2sigma,
+            upper_2sigma=upper_2sigma,
+        )
+        if put_row is None or call_row is None:
+            self.bt_ref_value.setText("No chain rows available for IC reference.")
+            return
+
+        ref_text = (
+            f"SELL PUT {put_row.strike:,.0f} (Δ {put_row.put_delta:+.3f}, Bid {put_row.put_bid:,.4f}) | "
+            f"SELL CALL {call_row.strike:,.0f} (Δ {call_row.call_delta:+.3f}, Bid {call_row.call_bid:,.4f})"
+        )
+        notes: List[str] = []
+        if lower_outside:
+            notes.append("Lower band is below current chain range.")
+        if upper_outside:
+            notes.append("Upper band is above current chain range.")
+        if notes:
+            ref_text = f"{ref_text} | {' '.join(notes)} Increase ATM Wings for wider strikes."
+        self.bt_ref_value.setText(ref_text)
+
+    def _on_backtest_success(self, result: BacktestStatsResult):
+        self._last_backtest_result = result
+        self.bt_samples_value.setText(
+            f"{result.sample_count} (weekly ratio changes, {result.settlement_count} settlements)"
+        )
+        self.bt_avg_value.setText(f"{result.avg_price:+.3%}")
+        self.bt_std_value.setText(f"{result.std_price:.3%}")
+        self.bt_band_value.setText(
+            f"{result.lower_2sigma:,.2f} ~ {result.upper_2sigma:,.2f} (base {result.base_price:,.2f})"
+        )
+        self._update_backtest_reference_text(
+            lower_2sigma=result.lower_2sigma,
+            upper_2sigma=result.upper_2sigma,
+        )
+
+    def _on_backtest_failed(self, message: str):
+        self.bt_ref_value.setText(f"Error: {message}")
+        QMessageBox.warning(self, "Backtest Failed", message)
+
+    def _cleanup_backtest_worker(self, *_):
+        self.bt_calc_btn.setEnabled(True)
+        if self._backtest_thread:
+            self._backtest_thread.quit()
+            self._backtest_thread.wait()
+        if self._backtest_worker:
+            self._backtest_worker.deleteLater()
+        if self._backtest_thread:
+            self._backtest_thread.deleteLater()
+        self._backtest_worker = None
+        self._backtest_thread = None
 
     def _set_open_headers(self, deribit_mode: bool):
         left = "Open Int" if deribit_mode else "ITM Prob"
@@ -1410,8 +1774,11 @@ class MainWindow(QMainWindow):
             self.leg_titles[0].setStyleSheet(f"font-weight: 700; color: #7cd89a; font-size: {title_font_px}px;")
             self.leg_titles[1].setStyleSheet(f"font-weight: 700; color: #f3a2a9; font-size: {title_font_px}px;")
         for action_combo, strike_combo, _ in self.leg_controls:
-            action_combo.setFixedSize(self._s(110), self._s(30))
-            strike_combo.setFixedSize(self._s(134), self._s(30))
+            combo_h = self._s(28)
+            action_combo.setMinimumSize(0, combo_h)
+            action_combo.setMaximumHeight(combo_h)
+            strike_combo.setMinimumSize(0, combo_h)
+            strike_combo.setMaximumHeight(combo_h)
         deribit_w = self.deribit_check.sizeHint().width() + self._s(12)
         auto_w = self.auto_check.sizeHint().width() + self._s(12)
         self.deribit_check.setMinimumWidth(deribit_w)
@@ -1429,8 +1796,12 @@ class MainWindow(QMainWindow):
         self.open_ic_btn.setFixedSize(self._s(180), self._s(34))
         self.close_ic_btn.setFixedSize(self._s(170), self._s(34))
         self.delete_ic_btn.setFixedSize(self._s(176), self._s(34))
-        self.sim_bar.setMinimumHeight(self._s(112))
-        self.sim_bar.setMaximumHeight(self._s(148))
+        self.bt_start_input.setFixedSize(self._s(136), self._s(30))
+        self.bt_end_input.setFixedSize(self._s(136), self._s(30))
+        self.bt_calc_btn.setFixedSize(self._s(118), self._s(34))
+        self.backtest_box.setMinimumHeight(self._s(94))
+        self.sim_bar.setMinimumHeight(self._s(138))
+        self.sim_bar.setMaximumHeight(self._s(198))
         self.pos_table.setMinimumHeight(self._s(120))
         self.pos_table.setMaximumHeight(self._s(200))
         title_h = self._s(14)
@@ -1491,6 +1862,9 @@ class MainWindow(QMainWindow):
         if self._expiry_thread and self._expiry_thread.isRunning():
             self._expiry_thread.quit()
             self._expiry_thread.wait()
+        if self._backtest_thread and self._backtest_thread.isRunning():
+            self._backtest_thread.quit()
+            self._backtest_thread.wait()
         super().closeEvent(event)
 
     @staticmethod
@@ -1586,6 +1960,15 @@ class MainWindow(QMainWindow):
                 background-color: #101726;
                 border: 1px solid #283243;
                 border-radius: {border_radius}px;
+            }}
+            #backtestBox {{
+                background-color: #0f1c2b;
+                border: 1px solid #2a3d58;
+                border-radius: {border_radius}px;
+            }}
+            #backtestTitle {{
+                color: #9cb6df;
+                font-weight: 700;
             }}
             #infoCard {{
                 background-color: #101a28;
