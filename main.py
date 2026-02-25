@@ -39,6 +39,7 @@ from iv_history import DeribitIVHistory, IVPoint
 
 TRADING_DAYS = 365.0
 RISK_FREE_RATE = 0.0
+EN_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 @dataclass
@@ -407,7 +408,8 @@ class DeribitAnalyzer:
             left_hours = max((ts - now_ms) / (1000 * 3600), 0.0)
             left_days = int(left_hours // 24)
             left_h = int(left_hours % 24)
-            label = f"{dt.strftime('%d %b %Y')} ({left_days}d {left_h}h)"
+            month = EN_MONTH_ABBR[dt.month - 1]
+            label = f"{dt.day:02d} {month} {dt.year} ({left_days}d {left_h}h)"
             choices.append((ts, label))
         return choices
 
@@ -681,7 +683,6 @@ class MainWindow(QMainWindow):
         self._expiry_worker: Optional[ExpiryLoadWorker] = None
         self._backtest_thread: Optional[QThread] = None
         self._backtest_worker: Optional[BacktestStatsWorker] = None
-        self._last_backtest_result: Optional[BacktestStatsResult] = None
         self._last_error_popup_ts: float = 0.0
 
         self.timer = QTimer(self)
@@ -853,7 +854,7 @@ class MainWindow(QMainWindow):
         backtest_layout = QVBoxLayout(self.backtest_box)
         backtest_layout.setContentsMargins(10, 8, 10, 8)
         backtest_layout.setSpacing(4)
-        self.backtest_title = QLabel("Backtest Stats (IC ±2σ)")
+        self.backtest_title = QLabel("Backtest Stats (±2σ)")
         self.backtest_title.setObjectName("backtestTitle")
         backtest_layout.addWidget(self.backtest_title)
 
@@ -870,7 +871,8 @@ class MainWindow(QMainWindow):
         bt_input_row = QHBoxLayout()
         bt_input_row.setContentsMargins(0, 0, 0, 0)
         bt_input_row.setSpacing(6)
-        bt_input_row.addWidget(QLabel("週結算(週變動比例)"))
+        bt_input_row.addWidget(QLabel("Weekly Settlement (Weekly Return)"))
+        bt_input_row.addStretch(1)
         bt_input_row.addWidget(QLabel("From"))
         bt_input_row.addWidget(self.bt_start_input)
         bt_input_row.addWidget(QLabel("To"))
@@ -886,14 +888,11 @@ class MainWindow(QMainWindow):
         self.bt_avg_value = QLabel("--")
         self.bt_std_value = QLabel("--")
         self.bt_band_value = QLabel("--")
-        self.bt_ref_value = QLabel("Press Calc to get IC reference strikes.")
-        self.bt_ref_value.setWordWrap(True)
         for value_label in (
             self.bt_samples_value,
             self.bt_avg_value,
             self.bt_std_value,
             self.bt_band_value,
-            self.bt_ref_value,
         ):
             value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         bt_grid.addWidget(QLabel("Samples"), 0, 0)
@@ -904,8 +903,6 @@ class MainWindow(QMainWindow):
         bt_grid.addWidget(self.bt_std_value, 1, 1)
         bt_grid.addWidget(QLabel("±2σ Band"), 1, 2)
         bt_grid.addWidget(self.bt_band_value, 1, 3)
-        bt_grid.addWidget(QLabel("IC Ref"), 2, 0)
-        bt_grid.addWidget(self.bt_ref_value, 2, 1, 1, 3)
         backtest_layout.addLayout(bt_grid)
 
         self.open_ic_btn = QPushButton("Open Strategy")
@@ -1223,11 +1220,6 @@ class MainWindow(QMainWindow):
         self._refresh_leg_strike_options(rows)
         self._mark_positions_to_market(rows)
         self._refresh_positions_table()
-        if self._last_backtest_result is not None:
-            self._update_backtest_reference_text(
-                lower_2sigma=self._last_backtest_result.lower_2sigma,
-                upper_2sigma=self._last_backtest_result.upper_2sigma,
-            )
 
     def _calculate_backtest_stats(self):
         if self._backtest_thread and self._backtest_thread.isRunning():
@@ -1243,7 +1235,7 @@ class MainWindow(QMainWindow):
             return
 
         self.bt_calc_btn.setEnabled(False)
-        self.bt_ref_value.setText("Calculating...")
+        self.bt_band_value.setText("Calculating...")
         self._backtest_thread = QThread(self)
         self._backtest_worker = BacktestStatsWorker(
             symbol=symbol,
@@ -1259,49 +1251,7 @@ class MainWindow(QMainWindow):
         self._backtest_worker.failed.connect(self._cleanup_backtest_worker)
         self._backtest_thread.start()
 
-    @staticmethod
-    def _pick_ic_reference_rows(
-        rows: List[ChainRow], lower_2sigma: float, upper_2sigma: float
-    ) -> Tuple[Optional[ChainRow], Optional[ChainRow], bool, bool]:
-        if not rows:
-            return None, None, False, False
-        ordered = sorted(rows, key=lambda x: x.strike)
-        put_candidates = [row for row in ordered if row.strike <= lower_2sigma]
-        call_candidates = [row for row in ordered if row.strike >= upper_2sigma]
-        put_row = put_candidates[-1] if put_candidates else ordered[0]
-        call_row = call_candidates[0] if call_candidates else ordered[-1]
-        lower_outside = put_row.strike > lower_2sigma
-        upper_outside = call_row.strike < upper_2sigma
-        return put_row, call_row, lower_outside, upper_outside
-
-    def _update_backtest_reference_text(self, lower_2sigma: float, upper_2sigma: float):
-        if not self._last_rows:
-            self.bt_ref_value.setText("Refresh option chain first to map ±2σ to strike references.")
-            return
-        put_row, call_row, lower_outside, upper_outside = self._pick_ic_reference_rows(
-            self._last_rows,
-            lower_2sigma=lower_2sigma,
-            upper_2sigma=upper_2sigma,
-        )
-        if put_row is None or call_row is None:
-            self.bt_ref_value.setText("No chain rows available for IC reference.")
-            return
-
-        ref_text = (
-            f"SELL PUT {put_row.strike:,.0f} (Δ {put_row.put_delta:+.3f}, Bid {put_row.put_bid:,.4f}) | "
-            f"SELL CALL {call_row.strike:,.0f} (Δ {call_row.call_delta:+.3f}, Bid {call_row.call_bid:,.4f})"
-        )
-        notes: List[str] = []
-        if lower_outside:
-            notes.append("Lower band is below current chain range.")
-        if upper_outside:
-            notes.append("Upper band is above current chain range.")
-        if notes:
-            ref_text = f"{ref_text} | {' '.join(notes)} Increase ATM Wings for wider strikes."
-        self.bt_ref_value.setText(ref_text)
-
     def _on_backtest_success(self, result: BacktestStatsResult):
-        self._last_backtest_result = result
         self.bt_samples_value.setText(
             f"{result.sample_count} (weekly ratio changes, {result.settlement_count} settlements)"
         )
@@ -1310,13 +1260,9 @@ class MainWindow(QMainWindow):
         self.bt_band_value.setText(
             f"{result.lower_2sigma:,.2f} ~ {result.upper_2sigma:,.2f} (base {result.base_price:,.2f})"
         )
-        self._update_backtest_reference_text(
-            lower_2sigma=result.lower_2sigma,
-            upper_2sigma=result.upper_2sigma,
-        )
 
     def _on_backtest_failed(self, message: str):
-        self.bt_ref_value.setText(f"Error: {message}")
+        self.bt_band_value.setText(f"Error: {message}")
         QMessageBox.warning(self, "Backtest Failed", message)
 
     def _cleanup_backtest_worker(self, *_):
