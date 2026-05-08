@@ -5,7 +5,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from backtest_stats import BacktestStatsResult, calculate_backtest_stats
 from iv_history import DeribitIVHistory, IVPoint
 
 TRADING_DAYS = 365.0
@@ -96,44 +97,6 @@ class StrategyPosition:
     closed_at: str = ""
     status: str = "OPEN"
     legacy_import: bool = False
-
-
-@dataclass
-class BacktestStatsResult:
-    start_utc: datetime
-    end_utc: datetime
-    sample_count: int
-    settlement_count: int
-    avg_price: float
-    std_price: float
-    lower_2sigma: float
-    upper_2sigma: float
-    base_price: float
-
-
-def _parse_local_datetime_input(raw_text: str, end_of_day_for_date: bool) -> datetime:
-    text = raw_text.strip()
-    if not text:
-        raise ValueError("Please input both start and end time.")
-
-    date_only_formats = ("%Y-%m-%d", "%Y/%m/%d")
-    all_formats = ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", *date_only_formats)
-    parsed: Optional[datetime] = None
-    used_date_only = False
-    for fmt in all_formats:
-        try:
-            parsed = datetime.strptime(text, fmt)
-            used_date_only = fmt in date_only_formats
-            break
-        except ValueError:
-            continue
-    if parsed is None:
-        raise ValueError("Invalid time format. Use YYYY-MM-DD or YYYY-MM-DD HH:MM.")
-
-    if used_date_only and end_of_day_for_date:
-        parsed = parsed.replace(hour=23, minute=59, second=59)
-    local_tz = datetime.now().astimezone().tzinfo or timezone.utc
-    return parsed.replace(tzinfo=local_tz).astimezone(timezone.utc)
 
 
 class DataFetchWorker(QObject):
@@ -311,68 +274,14 @@ class BacktestStatsWorker(QObject):
         self.end_text = end_text
         self.timeframe = timeframe
 
-    @staticmethod
-    def _first_weekly_settlement_anchor(start_utc: datetime) -> datetime:
-        # Deribit weekly settlement anchor: Friday 08:00 UTC.
-        anchor = start_utc.astimezone(timezone.utc).replace(hour=8, minute=0, second=0, microsecond=0)
-        days_to_friday = (4 - anchor.weekday()) % 7
-        anchor = anchor + timedelta(days=days_to_friday)
-        if anchor < start_utc:
-            anchor = anchor + timedelta(days=7)
-        return anchor
-
-    @classmethod
-    def _sample_weekly_settlement_prices(
-        cls, series: List[Tuple[int, float]], start_utc: datetime, end_utc: datetime
-    ) -> List[float]:
-        if not series:
-            return []
-        prices: List[float] = []
-        idx = 0
-        n = len(series)
-        anchor = cls._first_weekly_settlement_anchor(start_utc)
-        end_ms = int(end_utc.timestamp() * 1000)
-
-        while anchor.timestamp() * 1000 <= end_ms:
-            anchor_ms = int(anchor.timestamp() * 1000)
-            while idx < n and series[idx][0] < anchor_ms:
-                idx += 1
-            if idx >= n:
-                break
-            prices.append(series[idx][1])
-            anchor = anchor + timedelta(days=7)
-        return prices
-
     @Slot()
     def run(self):
         try:
-            start_utc = _parse_local_datetime_input(self.start_text, end_of_day_for_date=False)
-            end_utc = _parse_local_datetime_input(self.end_text, end_of_day_for_date=True)
-            analyzer = MarketAnalyzer(exchange_id="binance", symbol=self.symbol)
-            series = analyzer.fetch_close_series(start_utc=start_utc, end_utc=end_utc, timeframe=self.timeframe)
-            if len(series) < 2:
-                raise ValueError("Not enough candles in selected range. Please widen the time window.")
-
-            settlement_prices = self._sample_weekly_settlement_prices(series, start_utc=start_utc, end_utc=end_utc)
-            if len(settlement_prices) < 3:
-                raise ValueError("Need at least 3 weekly settlement samples in range for weekly-ratio stats.")
-            prices = np.array(settlement_prices, dtype=float)
-            returns = np.diff(prices) / prices[:-1]
-            mean_ret = float(np.mean(returns))
-            std_ret = float(np.std(returns, ddof=1))
-            base_price = float(prices[-1])
-            lower_mult = max(0.0, 1.0 + mean_ret - 2.0 * std_ret)
-            upper_mult = max(0.0, 1.0 + mean_ret + 2.0 * std_ret)
-            result = BacktestStatsResult(
-                start_utc=start_utc,
-                end_utc=end_utc,
-                sample_count=len(returns),
-                settlement_count=len(settlement_prices),
-                avg_price=mean_ret,
-                std_price=std_ret,
-                lower_2sigma=base_price * lower_mult,
-                upper_2sigma=base_price * upper_mult,
-                base_price=base_price,
+            result = calculate_backtest_stats(
+                symbol=self.symbol,
+                start_text=self.start_text,
+                end_text=self.end_text,
+                timeframe=self.timeframe,
             )
             self.finished.emit(result)
         except Exception as exc:
