@@ -1,3 +1,5 @@
 __pycache__/
 
 *.json
+
+run_btc_options.sh
